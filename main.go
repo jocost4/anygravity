@@ -37,17 +37,26 @@ var (
 	workspaceDir = filepath.Join(os.Getenv("HOME"), ".hermes/hermesgravity_workspace")
 
 	fallbackModels = []ModelItem{
-		{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High Effort)"},
-		{ID: "gemini-3.8-flash-low", Name: "Gemini 3.8 Flash (Low Effort)"},
-		{ID: "gemini-3.8-pro", Name: "Gemini 3.8 Pro"},
-		{ID: "claude-sonnet-4-6", Name: "Claude Sonnet 4.6"},
-		{ID: "claude-opus-4-6-thinking", Name: "Claude Opus 4.6 Thinking"},
-		{ID: "gpt-5-mini", Name: "GPT-5 Mini"},
+		{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High)"},
+		{ID: "gemini-3.8-flash-medium", Name: "Gemini 3.8 Flash (Medium)"},
+		{ID: "gemini-3.8-flash-low", Name: "Gemini 3.8 Flash (Low)"},
+		{ID: "gemini-3.7-flash-high", Name: "Gemini 3.7 Flash (High)"},
+		{ID: "gemini-3.7-flash-medium", Name: "Gemini 3.7 Flash (Medium)"},
+		{ID: "gemini-3.7-flash-low", Name: "Gemini 3.7 Flash (Low)"},
+		{ID: "gemini-3.6-flash-high", Name: "Gemini 3.6 Flash (High)"},
+		{ID: "gemini-3.6-flash-medium", Name: "Gemini 3.6 Flash (Medium)"},
+		{ID: "gemini-3.6-flash-low", Name: "Gemini 3.6 Flash (Low)"},
+		{ID: "gemini-3.1-pro-high", Name: "Gemini 3.1 Pro (High)"},
+		{ID: "gemini-3.1-pro-low", Name: "Gemini 3.1 Pro (Low)"},
+		{ID: "claude-sonnet-4-6", Name: "Claude Sonnet 4.6 (Thinking)"},
+		{ID: "claude-opus-4-6-thinking", Name: "Claude Opus 4.6 (Thinking)"},
+		{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B (Medium)"},
 	}
 
 	sessionMapFile = filepath.Join(os.Getenv("HOME"), ".hermes/antigravity_session_map.json")
 	sessionMu      sync.RWMutex
 	sessionCache   = make(map[string]string)
+	agyExecMu      sync.Mutex
 
 	brainDirs = []string{
 		filepath.Join(os.Getenv("HOME"), ".gemini/antigravity-cli/brain"),
@@ -180,48 +189,7 @@ var registry = &ModelRegistry{models: fallbackModels}
 
 func (r *ModelRegistry) GetModels() []ModelItem {
 	r.mu.RLock()
-	if time.Since(r.lastRefresh) < 5*time.Minute && len(r.models) > 0 {
-		defer r.mu.RUnlock()
-		return r.models
-	}
-	r.mu.RUnlock()
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if time.Since(r.lastRefresh) < 5*time.Minute && len(r.models) > 0 {
-		return r.models
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, agyBin, "models")
-	cmd.Env = append(os.Environ(), "PATH="+filepath.Join(os.Getenv("HOME"), ".local/bin")+":"+os.Getenv("PATH"))
-	out, err := cmd.Output()
-	if err != nil {
-		r.lastRefresh = time.Now().Add(-3 * time.Minute)
-		return r.models
-	}
-
-	var parsed []ModelItem
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		clean := strings.TrimSpace(line)
-		if clean == "" || strings.HasPrefix(clean, "⠋") || strings.HasPrefix(clean, "⠙") {
-			continue
-		}
-		parts := strings.Fields(clean)
-		if len(parts) >= 2 {
-			parsed = append(parsed, ModelItem{ID: parts[0], Name: strings.Join(parts[1:], " ")})
-		} else if len(parts) == 1 {
-			parsed = append(parsed, ModelItem{ID: parts[0], Name: parts[0]})
-		}
-	}
-
-	if len(parsed) > 0 {
-		r.models = parsed
-		r.lastRefresh = time.Now()
-	}
+	defer r.mu.RUnlock()
 	return r.models
 }
 
@@ -625,6 +593,12 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	model := req.Model
+	if strings.Contains(model, "/") {
+		parts := strings.Split(model, "/")
+		model = parts[len(parts)-1]
+	}
+	model = strings.TrimPrefix(model, "custom:")
+	model = strings.TrimSpace(model)
 	if model == "" || model == "auto" {
 		model = "gemini-3.8-flash-high"
 	}
@@ -661,10 +635,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	effort := req.ReasoningEffort
 	modelHasEffort := strings.HasSuffix(model, "-high") || strings.HasSuffix(model, "-medium") || strings.HasSuffix(model, "-low") || strings.HasSuffix(model, "-max")
-	if !modelHasEffort {
-		if effort == "" {
-			effort = "medium"
-		}
+	if !modelHasEffort && effort != "" {
 		args = append(args, "--effort", effort)
 	}
 
@@ -740,6 +711,9 @@ func handleStreamingCompletion(
 	initBytes, _ := json.Marshal(initChunk)
 	fmt.Fprintf(w, "data: %s\n\n", initBytes)
 	flusher.Flush()
+
+	agyExecMu.Lock()
+	defer agyExecMu.Unlock()
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -1011,6 +985,9 @@ func handleNonStreamingCompletion(
 	createdTs int64,
 	sessionKey, initialConvID, finalPrompt string,
 ) {
+	agyExecMu.Lock()
+	defer agyExecMu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
 	defer cancel()
 
