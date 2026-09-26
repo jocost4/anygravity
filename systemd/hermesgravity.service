@@ -1,0 +1,20 @@
+[Unit]
+Description=Hermesgravity - Ultra-lightweight Antigravity Provider Pipe for Hermes Agent
+After=network.target
+
+[Service]
+Type=exec
+User=ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/hermesgravity
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+KillSignal=SIGTERM
+
+# Hardened sandbox / resource constraints
+LimitNOFILE=65536
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target

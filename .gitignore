@@ -1,0 +1,16 @@
+# Binaries
+hermesgravity
+antigravity-proxy
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test and scratch files
+scratch/
+*.log
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
