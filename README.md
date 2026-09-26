@@ -3,32 +3,45 @@
   <a href="README.pt-BR.md"><b>🇧🇷 Português (Brasil)</b></a>
 </p>
 
-<p align="center">
-  <img src="assets/banner.svg" alt="Hermesgravity Banner" width="100%">
-</p>
-
-<p align="center">
-  <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go Version"></a>
-  <a href="#-memory-benchmarks"><img src="https://img.shields.io/badge/RAM-~4.9%20MB-success?style=flat-square" alt="Memory"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="License"></a>
-  <a href="https://github.com/jocost4/hermesgravity/stargazers"><img src="https://img.shields.io/github/stars/jocost4/hermesgravity?style=flat-square" alt="Stars"></a>
-  <a href="https://github.com/jocost4/hermesgravity/issues"><img src="https://img.shields.io/github/issues/jocost4/hermesgravity?style=flat-square" alt="Issues"></a>
-</p>
-
 ```text
-       ▲         HERMESGRAVITY v1.0.0
-      ███        High-Performance Go Pipe & MCP Bridge
-     ██ ██       Google Antigravity (`agy` CLI) ➔ Hermes Agent
-    ██ ⚡ ██      Memory: ~4.9 MB RSS | Zero GIL | STDIN Pipe Streaming
-   ██       ██   Models: Gemini 3.8 Flash/Pro · Claude Sonnet/Opus · GPT-5
-  ██         ██  Features: Bidirectional Tool Calling · reasoning_content · Ping Keep-Alive
+                                                           ::-==+**+=:              
+                                                 :::::-=*><<<<>*=+>)}[*:          
+                                         :  :=>)[}%%#[[[}@@@@#>++]%)-     :    
+                                           :+>)}##[<+-     -[@@%[><[#)=           
+                                     :*)])]#@%*:   :-*<[%%}[][[[<=      ::     
+                                    :>[)*>[@@@@%###%%%%##%}}[)*=:   :----:      
+                                    -[%]=--*]}#%%#%###}[]<*-:   :-===-:::        
+                                    -#%[>+=: ::::::    : :::-++===-:::::         
+                                        =)][[]<>*+*+++**>*><+*=-:::::               
+                                                 ::-===++===-::                           
+
+██╗  ██╗███████╗██████╗ ███╗   ███╗███████╗███████╗ ██████╗ ██████╗  █████╗ ██╗   ██╗██╗████████╗██╗   ██╗
+██║  ██║██╔════╝██╔══██╗████╗ ████║██╔════╝██╔════╝██╔════╝ ██╔══██╗██╔══██╗██║   ██║██║╚══██╔══╝╚██╗ ██╔╝
+███████║█████╗  ██████╔╝██╔████╔██║█████╗  ███████╗██║  ███╗██████╔╝███████║██║   ██║██║   ██║    ╚████╔╝ 
+██╔══██║██╔══╝  ██╔══██╗██║╚██╔╝██║██╔══╝  ╚════██║██║   ██║██╔══██╗██╔══██║╚██╗ ██╔╝██║   ██║     ╚██╔╝  
+██║  ██║███████╗██║  ██║██║ ╚═╝ ██║███████╗███████║╚██████╔╝██║  ██║██║  ██║ ╚████╔╝ ██║   ██║      ██║   
+╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝   ╚═╝      ╚═╝   
 ```
+
+<p align="center">
+  <b>High-Performance Go Pipe &amp; MCP Bridge for Hermes Agent</b><br>
+  <i>Connects Google Antigravity (<code>agy</code> CLI) as an OpenAI SSE Inference Provider &amp; MCP Server</i>
+</p>
+
+<p align="center">
+  <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.22+-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go Version"></a>
+  <a href="#-memory-benchmarks"><img src="https://img.shields.io/badge/RAM-~4.9%20MB-2ea44f?style=for-the-badge" alt="Memory"></a>
+  <a href="#-the-hard-problems-solved"><img src="https://img.shields.io/badge/Zero-GIL-blueviolet?style=for-the-badge" alt="Zero GIL"></a>
+  <a href="#-the-hard-problems-solved"><img src="https://img.shields.io/badge/STDIN-Streaming-orange?style=for-the-badge" alt="STDIN Streaming"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge" alt="License"></a>
+  <a href="https://github.com/jocost4/hermesgravity/stargazers"><img src="https://img.shields.io/github/stars/jocost4/hermesgravity?style=for-the-badge" alt="Stars"></a>
+</p>
 
 ---
 
 ## 🚀 Overview
 
-**Hermesgravity** is an ultra-lightweight, high-performance bridge and proxy written in **pure standard-library Go (zero external dependencies, zero CGO)**. It connects Google Antigravity (`agy` CLI) directly to **Hermes Agent** as an OpenAI SSE inference provider and an MCP subagent server.
+**Hermesgravity** is an ultra-lightweight, high-performance bridge written in **pure standard-library Go (zero external dependencies, zero CGO, 100% static binary)**. It connects Google Antigravity (`agy` CLI) directly to **Hermes Agent** as an OpenAI SSE inference provider and an MCP subagent server.
 
 Designed specifically to run reliably in resource-constrained environments (such as cloud VPS instances with 1 vCPU and 1 GB RAM) without freezing, leaking memory, or crashing during long conversations.
 
