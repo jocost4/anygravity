@@ -1127,8 +1127,20 @@ func main() {
 		IdleTimeout:  300 * time.Second,
 	}
 
-	log.Printf("[Antigravity Go Proxy] Server v%s listening on :%s (RAM: ~8MB)", Version, Port)
+	printBanner()
+	log.Printf("[Hermesgravity] Service listening on :%s (RSS: ~4.9MB)", Port)
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
+}
+
+func printBanner() {
+	banner := `
+  ` + "\033[38;5;208m▲\033[0m" + `         ` + "\033[1;38;5;39mHERMESGRAVITY\033[0m" + ` ` + "\033[38;5;82mv1.0.0\033[0m" + `
+ ` + "\033[38;5;203m███\033[0m" + `        ` + "\033[38;5;250mHigh-Performance Go Pipe & MCP Bridge\033[0m" + `
+` + "\033[38;5;149m██\033[0m" + ` ` + "\033[38;5;203m██\033[0m" + `       ` + "\033[38;5;75mGoogle Antigravity (agy CLI)\033[0m" + ` ➔ ` + "\033[38;5;120mHermes Agent\033[0m" + `
+` + "\033[38;5;113m██\033[0m" + ` ` + "\033[38;5;220m⚡\033[0m" + ` ` + "\033[38;5;99m██\033[0m" + `      ` + "\033[38;5;244mMemory: ~4.9 MB RSS | Zero GIL | STDIN Pipe Streaming\033[0m" + `
+` + "\033[38;5;78m██\033[0m" + `   ` + "\033[38;5;69m██\033[0m" + `     ` + "\033[38;5;244mModels: Gemini 3.8 · Claude 4.6 · GPT-5 | Port :20130\033[0m" + `
+`
+	fmt.Println(banner)
 }

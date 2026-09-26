@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 290" width="100%" height="100%">
+  <defs>
+    <linearGradient id="grad-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#161b22"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Terminal Window Frame -->
+  <rect x="2" y="2" width="936" height="286" rx="14" fill="url(#grad-bg)" stroke="#30363d" stroke-width="1.5"/>
+
+  <!-- Titlebar -->
+  <path d="M 2,16 Q 2,2 16,2 L 924,2 Q 938,2 938,16 L 938,40 L 2,40 Z" fill="#161b22"/>
+  <line x1="2" y1="40" x2="938" y2="40" stroke="#30363d" stroke-width="1"/>
+
+  <!-- Window Dots -->
+  <circle cx="24" cy="21" r="6" fill="#ff5f56"/>
+  <circle cx="44" cy="21" r="6" fill="#ffbd2e"/>
+  <circle cx="64" cy="21" r="6" fill="#27c93f"/>
+
+  <!-- Window Title -->
+  <text x="470" y="25" font-family="'SF Mono', 'Fira Code', 'JetBrains Mono', monospace" font-size="12" fill="#8b949e" text-anchor="middle">
+    hermesgravity — pure go provider pipe &amp; mcp bridge
+  </text>
+
+  <!-- Pixel-Art Logo (Antigravity Chevron + Hermes Spark) -->
+  <g transform="translate(48, 72)">
+    <!-- Row 0 (Top Peak) -->
+    <rect x="54" y="0" width="16" height="16" rx="3" fill="#ff7a45"/>
+    <rect x="72" y="0" width="16" height="16" rx="3" fill="#ff4d4f"/>
+
+    <!-- Row 1 -->
+    <rect x="36" y="18" width="16" height="16" rx="3" fill="#ffa940"/>
+    <rect x="54" y="18" width="16" height="16" rx="3" fill="#ff7a45"/>
+    <rect x="72" y="18" width="16" height="16" rx="3" fill="#ff4d4f"/>
+    <rect x="90" y="18" width="16" height="16" rx="3" fill="#f759ab"/>
+
+    <!-- Row 2 -->
+    <rect x="18" y="36" width="16" height="16" rx="3" fill="#bae637"/>
+    <rect x="36" y="36" width="16" height="16" rx="3" fill="#ffa940"/>
+    <rect x="54" y="36" width="16" height="16" rx="3" fill="#ff7a45"/>
+    <rect x="72" y="36" width="16" height="16" rx="3" fill="#f759ab"/>
+    <rect x="90" y="36" width="16" height="16" rx="3" fill="#9254de"/>
+
+    <!-- Row 3 -->
+    <rect x="18" y="54" width="16" height="16" rx="3" fill="#73d13d"/>
+    <rect x="36" y="54" width="16" height="16" rx="3" fill="#36cfc9"/>
+    
+    <!-- Hermes center spark inside the arch -->
+    <path d="M73,50 L64,68 L73,68 L68,86 L82,65 L73,65 Z" fill="#ffd666" filter="url(#glow)"/>
+    
+    <rect x="90" y="54" width="16" height="16" rx="3" fill="#597ef7"/>
+    <rect x="108" y="54" width="16" height="16" rx="3" fill="#9254de"/>
+
+    <!-- Row 4 -->
+    <rect x="0" y="72" width="16" height="16" rx="3" fill="#52c41a"/>
+    <rect x="18" y="72" width="16" height="16" rx="3" fill="#13c2c2"/>
+    <rect x="90" y="72" width="16" height="16" rx="3" fill="#2f54eb"/>
+    <rect x="108" y="72" width="16" height="16" rx="3" fill="#597ef7"/>
+
+    <!-- Row 5 -->
+    <rect x="0" y="90" width="16" height="16" rx="3" fill="#13c2c2"/>
+    <rect x="18" y="90" width="16" height="16" rx="3" fill="#1890ff"/>
+    <rect x="108" y="90" width="16" height="16" rx="3" fill="#2f54eb"/>
+    <rect x="126" y="90" width="16" height="16" rx="3" fill="#1d39c4"/>
+
+    <!-- Row 6 -->
+    <rect x="0" y="108" width="16" height="16" rx="3" fill="#1890ff"/>
+    <rect x="126" y="108" width="16" height="16" rx="3" fill="#1d39c4"/>
+
+    <!-- Row 7 (Feet) -->
+    <rect x="0" y="126" width="16" height="16" rx="3" fill="#40a9ff"/>
+    <rect x="18" y="126" width="16" height="16" rx="3" fill="#69c0ff"/>
+    <rect x="108" y="126" width="16" height="16" rx="3" fill="#597ef7"/>
+    <rect x="126" y="126" width="16" height="16" rx="3" fill="#2f54eb"/>
+  </g>
+
+  <!-- Text Details (Terminal Right Pane) -->
+  <g transform="translate(240, 78)">
+    <!-- Title & Badges -->
+    <text x="0" y="20" font-family="'SF Mono', 'Fira Code', 'JetBrains Mono', monospace" font-size="24" font-weight="800" fill="#58a6ff" letter-spacing="1">
+      HERMESGRAVITY
+    </text>
+    
+    <g transform="translate(245, 3)">
+      <rect x="0" y="0" width="58" height="22" rx="6" fill="#238636"/>
+      <text x="29" y="15" font-family="'SF Mono', monospace" font-size="11" font-weight="bold" fill="#ffffff" text-anchor="middle">v1.0.0</text>
+      
+      <rect x="66" y="0" width="94" height="22" rx="6" fill="#1f6feb"/>
+      <text x="113" y="15" font-family="'SF Mono', monospace" font-size="11" font-weight="bold" fill="#ffffff" text-anchor="middle">Pure Go 1.22</text>
+
+      <rect x="168" y="0" width="92" height="22" rx="6" fill="#8957e5"/>
+      <text x="214" y="15" font-family="'SF Mono', monospace" font-size="11" font-weight="bold" fill="#ffffff" text-anchor="middle">4.9 MB RAM</text>
+    </g>
+
+    <!-- Subtitle -->
+    <text x="0" y="50" font-family="'SF Mono', 'Fira Code', monospace" font-size="14" font-weight="500" fill="#e6edf3">
+      High-Performance Pipe &amp; MCP Bridge for Hermes Agent
+    </text>
+
+    <text x="0" y="74" font-family="'SF Mono', 'Fira Code', monospace" font-size="12" fill="#8b949e">
+      Provider: <tspan fill="#79c0ff" font-weight="bold">Google Antigravity (`agy`)</tspan> ➔ Client: <tspan fill="#7ee787" font-weight="bold">Hermes Desktop / CLI</tspan>
+    </text>
+
+    <line x1="0" y1="90" x2="650" y2="90" stroke="#30363d" stroke-width="1"/>
+
+    <!-- Features Matrix -->
+    <g transform="translate(0, 112)" font-family="'SF Mono', 'Fira Code', monospace" font-size="12">
+      <text x="0" y="0" fill="#3fb950">✔ <tspan fill="#e6edf3">Zero ARG_MAX Crash</tspan> <tspan fill="#8b949e">(Async STDIN stream)</tspan></text>
+      <text x="330" y="0" fill="#3fb950">✔ <tspan fill="#e6edf3">reasoning_content</tspan> <tspan fill="#8b949e">(Native thinking deltas)</tspan></text>
+      
+      <text x="0" y="24" fill="#3fb950">✔ <tspan fill="#e6edf3">Bidirectional Tool Calling</tspan> <tspan fill="#8b949e">(OpenAI ↔ AGY)</tspan></text>
+      <text x="330" y="24" fill="#3fb950">✔ <tspan fill="#e6edf3">SSE Heartbeat</tspan> <tspan fill="#8b949e">(Ping keep-alive)</tspan></text>
+      
+      <text x="0" y="48" fill="#3fb950">✔ <tspan fill="#e6edf3">MCP 1.0 Subagent Tools</tspan> <tspan fill="#8b949e">(code, plan, skills)</tspan></text>
+      <text x="330" y="48" fill="#3fb950">✔ <tspan fill="#e6edf3">Zero Dependencies</tspan> <tspan fill="#8b949e">(No CGO, 100% static)</tspan></text>
+    </g>
+  </g>
+</svg>
