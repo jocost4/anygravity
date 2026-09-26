@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -32,7 +33,8 @@ const (
 )
 
 var (
-	agyBin = filepath.Join(os.Getenv("HOME"), ".local/bin/agy")
+	agyBin       = filepath.Join(os.Getenv("HOME"), ".local/bin/agy")
+	workspaceDir = filepath.Join(os.Getenv("HOME"), ".hermes/hermesgravity_workspace")
 
 	fallbackModels = []ModelItem{
 		{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High Effort)"},
@@ -59,6 +61,43 @@ var (
 type ModelItem struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+}
+
+// -----------------------------------------------------------------------------
+// Workspace & Customization Guard
+// -----------------------------------------------------------------------------
+func initWorkspace() {
+	agentsDir := filepath.Join(workspaceDir, ".agents")
+	_ = os.MkdirAll(agentsDir, 0755)
+
+	geminiMd := filepath.Join(workspaceDir, "GEMINI.md")
+	geminiContent := `# HERMESGRAVITY COMPLETION ENGINE
+You are acting as the backend AI completion model for Hermes Agent.
+You MUST NOT execute any local system tools or commands directly.
+When a tool is needed, respond ONLY with:
+<tool_call>
+{"name": "tool_name", "arguments": {...}}
+</tool_call>
+`
+	_ = os.WriteFile(geminiMd, []byte(geminiContent), 0644)
+
+	hooksJson := filepath.Join(agentsDir, "hooks.json")
+	hooksContent := `{
+  "deny-all-tools": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "command": "echo '{\"decision\": \"deny\", \"reason\": \"Local tool execution is disabled by Hermesgravity. Output tool calls as text <tool_call>...\"}'"
+          }
+        ]
+      }
+    ]
+  }
+}
+`
+	_ = os.WriteFile(hooksJson, []byte(hooksContent), 0644)
 }
 
 // -----------------------------------------------------------------------------
@@ -294,6 +333,13 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 			}
 			sb.WriteString(fmt.Sprintf("[Tool Result for '%s']:\n%s\n\n", toolName, c))
 		}
+	}
+
+	if toolsPrompt != "" {
+		sb.WriteString("[CRITICAL REMINDER]\n")
+		sb.WriteString("You are strictly the completion engine for Hermes Agent. Do NOT invoke local tools directly.\n")
+		sb.WriteString("When calling a tool from [AVAILABLE TOOLS], respond ONLY with:\n")
+		sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n\n")
 	}
 
 	sb.WriteString("Assistant:")
@@ -699,6 +745,8 @@ func handleStreamingCompletion(
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, agyBin, args...)
+	cmd.Dir = workspaceDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = append(os.Environ(), "PATH="+filepath.Join(os.Getenv("HOME"), ".local/bin")+":"+os.Getenv("PATH"))
 
 	stdin, err := cmd.StdinPipe()
@@ -728,6 +776,13 @@ func handleStreamingCompletion(
 		emitErrorAndDone(w, flusher, completionID, model, createdTs, fmt.Sprintf("Process start error: %v", err))
 		return
 	}
+
+	go func() {
+		<-ctx.Done()
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+	}()
 
 	// Stream prompt through StdinPipe in background
 	go func() {
@@ -960,6 +1015,8 @@ func handleNonStreamingCompletion(
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, agyBin, args...)
+	cmd.Dir = workspaceDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = append(os.Environ(), "PATH="+filepath.Join(os.Getenv("HOME"), ".local/bin")+":"+os.Getenv("PATH"))
 	cmd.Stdin = strings.NewReader(finalPrompt)
 
@@ -967,7 +1024,20 @@ func handleNonStreamingCompletion(
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		log.Printf("[Proxy] Non-stream start error: %v", err)
+		http.Error(w, fmt.Sprintf("AGY Error: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	go func() {
+		<-ctx.Done()
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+	}()
+
+	if err := cmd.Wait(); err != nil {
 		log.Printf("[Proxy] Non-stream run error: %v, stderr: %s", err, stderrBuf.String())
 		http.Error(w, fmt.Sprintf("AGY Error: %v: %s", err, stderrBuf.String()), http.StatusInternalServerError)
 		return
@@ -1108,6 +1178,7 @@ func handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 // Main Entrypoint
 // -----------------------------------------------------------------------------
 func main() {
+	initWorkspace()
 	loadSessionMap()
 
 	mux := http.NewServeMux()
