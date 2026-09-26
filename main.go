@@ -332,7 +332,13 @@ var (
 	blockRegex    = regexp.MustCompile("(?s)```tool_call\\s*(.*?)\\s*```")
 	internalRegex = regexp.MustCompile(`call:(?:default_api:)?([a-zA-Z0-9_-]+)\{([^}]+)\}`)
 	thinkRegex    = regexp.MustCompile(`(?s)<(?:think|thought)>(.*?)</(?:think|thought)>`)
+	toolCallCounter atomic.Uint64
 )
+
+func nextToolCallID() string {
+	n := toolCallCounter.Add(1)
+	return fmt.Sprintf("call_%d_%x", n, time.Now().UnixNano()&0xffff)
+}
 
 func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) {
 	cleaned := text
@@ -352,7 +358,7 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 		if err := json.Unmarshal([]byte(raw), &single); err == nil && single.Name != "" {
 			tc := ParsedToolCall{
 				Index: len(toolCalls),
-				ID:    fmt.Sprintf("call_%x", time.Now().UnixNano()%0xffffff),
+				ID:    nextToolCallID(),
 				Type:  "function",
 			}
 			tc.Function.Name = strings.TrimSpace(single.Name)
@@ -372,7 +378,7 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 		if err := json.Unmarshal([]byte(raw), &single); err == nil && single.Name != "" {
 			tc := ParsedToolCall{
 				Index: len(toolCalls),
-				ID:    fmt.Sprintf("call_%x", time.Now().UnixNano()%0xffffff),
+				ID:    nextToolCallID(),
 				Type:  "function",
 			}
 			tc.Function.Name = strings.TrimSpace(single.Name)
@@ -388,7 +394,7 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 		argsStr := "{" + m[2] + "}"
 		tc := ParsedToolCall{
 			Index: len(toolCalls),
-			ID:    fmt.Sprintf("call_%x", time.Now().UnixNano()%0xffffff),
+			ID:    nextToolCallID(),
 			Type:  "function",
 		}
 		tc.Function.Name = strings.TrimSpace(tname)
@@ -582,7 +588,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	reqCount.Add(1)
 
 	var req ChatCompletionRequest
-	bodyBytes, err := io.ReadAll(r.Body)
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
 	if err != nil {
 		http.Error(w, "Invalid body", http.StatusBadRequest)
 		return
@@ -646,35 +652,13 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if req.Stream {
 		handleStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, convID, finalPrompt)
 	} else {
-		handleNonStreamingCompletion(w, args, completionID, model, createdTs, sessionKey, convID, finalPrompt)
+		handleNonStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, convID, finalPrompt)
 	}
 }
 
 // -----------------------------------------------------------------------------
 // Streaming SSE Engine with Heartbeat & Error Recovery
 // -----------------------------------------------------------------------------
-func emitErrorAndDone(w http.ResponseWriter, flusher http.Flusher, id, model string, created int64, errMsg string) {
-	chunk := map[string]interface{}{
-		"id":      id,
-		"object":  "chat.completion.chunk",
-		"created": created,
-		"model":   model,
-		"choices": []map[string]interface{}{
-			{
-				"index": 0,
-				"delta": map[string]interface{}{
-					"content": fmt.Sprintf("\n\n[Antigravity Error: %s]", errMsg),
-				},
-				"finish_reason": "stop",
-			},
-		},
-	}
-	b, _ := json.Marshal(chunk)
-	fmt.Fprintf(w, "data: %s\n\n", b)
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
-}
-
 func handleStreamingCompletion(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -694,6 +678,39 @@ func handleStreamingCompletion(
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
+	var writeMu sync.Mutex
+	var lastWrite atomic.Int64
+	lastWrite.Store(time.Now().Unix())
+
+	writeSSE := func(msg string) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		fmt.Fprint(w, msg)
+		flusher.Flush()
+		lastWrite.Store(time.Now().Unix())
+	}
+
+	emitErrorSSE := func(errMsg string) {
+		chunk := map[string]interface{}{
+			"id":      completionID,
+			"object":  "chat.completion.chunk",
+			"created": createdTs,
+			"model":   model,
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"delta": map[string]interface{}{
+						"content": fmt.Sprintf("\n\n[Antigravity Error: %s]", errMsg),
+					},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		b, _ := json.Marshal(chunk)
+		writeSSE(fmt.Sprintf("data: %s\n\n", b))
+		writeSSE("data: [DONE]\n\n")
+	}
+
 	// Emit initial role chunk (<5ms)
 	initChunk := map[string]interface{}{
 		"id":      completionID,
@@ -709,8 +726,7 @@ func handleStreamingCompletion(
 		},
 	}
 	initBytes, _ := json.Marshal(initChunk)
-	fmt.Fprintf(w, "data: %s\n\n", initBytes)
-	flusher.Flush()
+	writeSSE(fmt.Sprintf("data: %s\n\n", initBytes))
 
 	agyExecMu.Lock()
 	defer agyExecMu.Unlock()
@@ -725,18 +741,18 @@ func handleStreamingCompletion(
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		emitErrorAndDone(w, flusher, completionID, model, createdTs, fmt.Sprintf("StdinPipe error: %v", err))
+		emitErrorSSE(fmt.Sprintf("StdinPipe error: %v", err))
 		return
 	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		emitErrorAndDone(w, flusher, completionID, model, createdTs, fmt.Sprintf("StdoutPipe error: %v", err))
+		emitErrorSSE(fmt.Sprintf("StdoutPipe error: %v", err))
 		return
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		emitErrorAndDone(w, flusher, completionID, model, createdTs, fmt.Sprintf("StderrPipe error: %v", err))
+		emitErrorSSE(fmt.Sprintf("StderrPipe error: %v", err))
 		return
 	}
 
@@ -747,13 +763,14 @@ func handleStreamingCompletion(
 
 	if err := cmd.Start(); err != nil {
 		log.Printf("[Proxy] Command start error: %v", err)
-		emitErrorAndDone(w, flusher, completionID, model, createdTs, fmt.Sprintf("Process start error: %v", err))
+		emitErrorSSE(fmt.Sprintf("Process start error: %v", err))
 		return
 	}
 
+	var processExited atomic.Bool
 	go func() {
 		<-ctx.Done()
-		if cmd.Process != nil {
+		if !processExited.Load() && cmd.Process != nil {
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 	}()
@@ -771,16 +788,13 @@ func handleStreamingCompletion(
 
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-	var lastWrite atomic.Int64
-	lastWrite.Store(time.Now().Unix())
 
 	go func() {
 		for {
 			select {
 			case <-ticker.C:
 				if time.Now().Unix()-lastWrite.Load() >= 10 {
-					fmt.Fprintf(w, ": ping\n\n")
-					flusher.Flush()
+					writeSSE(": ping\n\n")
 				}
 			case <-ctx.Done():
 				return
@@ -849,21 +863,25 @@ func handleStreamingCompletion(
 						},
 					}
 					b, _ := json.Marshal(chunk)
-					fmt.Fprintf(w, "data: %s\n\n", b)
-					flusher.Flush()
-					lastWrite.Store(time.Now().Unix())
+					writeSSE(fmt.Sprintf("data: %s\n\n", b))
 				}
 			}
 		}
 	}
 
+	if err := scanner.Err(); err != nil {
+		log.Printf("[Proxy] stdout scanner error: %v", err)
+	}
+
 	waitErr := cmd.Wait()
+	processExited.Store(true)
+
 	if waitErr != nil && accumulatedText.Len() == 0 {
 		errDetails := strings.TrimSpace(stderrBuf.String())
 		if errDetails == "" {
 			errDetails = waitErr.Error()
 		}
-		emitErrorAndDone(w, flusher, completionID, model, createdTs, errDetails)
+		emitErrorSSE(errDetails)
 		return
 	}
 
@@ -874,13 +892,24 @@ func handleStreamingCompletion(
 	if activeConvID != "" {
 		reasoning = extractReasoningFromTranscript(activeConvID)
 	}
-	if thinkMatches := thinkRegex.FindStringSubmatch(cleanText); len(thinkMatches) > 1 {
-		inThink := strings.TrimSpace(thinkMatches[1])
-		cleanText = strings.TrimSpace(thinkRegex.ReplaceAllString(cleanText, ""))
-		if reasoning != "" {
-			reasoning = reasoning + "\n\n" + inThink
-		} else {
-			reasoning = inThink
+	if thinkMatches := thinkRegex.FindAllStringSubmatch(cleanText, -1); len(thinkMatches) > 0 {
+		var thinkParts []string
+		for _, tm := range thinkMatches {
+			if len(tm) > 1 {
+				th := strings.TrimSpace(tm[1])
+				if th != "" {
+					thinkParts = append(thinkParts, th)
+				}
+			}
+		}
+		if len(thinkParts) > 0 {
+			allThink := strings.Join(thinkParts, "\n\n")
+			cleanText = strings.TrimSpace(thinkRegex.ReplaceAllString(cleanText, ""))
+			if reasoning != "" {
+				reasoning = reasoning + "\n\n" + allThink
+			} else {
+				reasoning = allThink
+			}
 		}
 	}
 
@@ -899,8 +928,26 @@ func handleStreamingCompletion(
 			},
 		}
 		rb, _ := json.Marshal(rChunk)
-		fmt.Fprintf(w, "data: %s\n\n", rb)
-		flusher.Flush()
+		writeSSE(fmt.Sprintf("data: %s\n\n", rb))
+	}
+
+	// Flush clean text buffered during tool call detection
+	if isBufferingTool && cleanText != "" {
+		txtChunk := map[string]interface{}{
+			"id":      completionID,
+			"object":  "chat.completion.chunk",
+			"created": createdTs,
+			"model":   model,
+			"choices": []map[string]interface{}{
+				{
+					"index":         0,
+					"delta":         map[string]interface{}{"content": cleanText},
+					"finish_reason": nil,
+				},
+			},
+		}
+		tb, _ := json.Marshal(txtChunk)
+		writeSSE(fmt.Sprintf("data: %s\n\n", tb))
 	}
 
 	if len(toolCalls) > 0 {
@@ -918,7 +965,7 @@ func handleStreamingCompletion(
 			},
 		}
 		tcb, _ := json.Marshal(tcChunk)
-		fmt.Fprintf(w, "data: %s\n\n", tcb)
+		writeSSE(fmt.Sprintf("data: %s\n\n", tcb))
 
 		finChunk := map[string]interface{}{
 			"id":      completionID,
@@ -934,26 +981,8 @@ func handleStreamingCompletion(
 			},
 		}
 		finBytes, _ := json.Marshal(finChunk)
-		fmt.Fprintf(w, "data: %s\n\n", finBytes)
+		writeSSE(fmt.Sprintf("data: %s\n\n", finBytes))
 	} else {
-		if isBufferingTool && cleanText != "" {
-			txtChunk := map[string]interface{}{
-				"id":      completionID,
-				"object":  "chat.completion.chunk",
-				"created": createdTs,
-				"model":   model,
-				"choices": []map[string]interface{}{
-					{
-						"index":         0,
-						"delta":         map[string]interface{}{"content": cleanText},
-						"finish_reason": nil,
-					},
-				},
-			}
-			tb, _ := json.Marshal(txtChunk)
-			fmt.Fprintf(w, "data: %s\n\n", tb)
-		}
-
 		stopChunk := map[string]interface{}{
 			"id":      completionID,
 			"object":  "chat.completion.chunk",
@@ -968,11 +997,10 @@ func handleStreamingCompletion(
 			},
 		}
 		sb, _ := json.Marshal(stopChunk)
-		fmt.Fprintf(w, "data: %s\n\n", sb)
+		writeSSE(fmt.Sprintf("data: %s\n\n", sb))
 	}
 
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
+	writeSSE("data: [DONE]\n\n")
 }
 
 // -----------------------------------------------------------------------------
@@ -980,6 +1008,7 @@ func handleStreamingCompletion(
 // -----------------------------------------------------------------------------
 func handleNonStreamingCompletion(
 	w http.ResponseWriter,
+	r *http.Request,
 	args []string,
 	completionID, model string,
 	createdTs int64,
@@ -988,7 +1017,7 @@ func handleNonStreamingCompletion(
 	agyExecMu.Lock()
 	defer agyExecMu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), DefaultTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, agyBin, args...)
@@ -1007,16 +1036,20 @@ func handleNonStreamingCompletion(
 		return
 	}
 
+	var processExited atomic.Bool
 	go func() {
 		<-ctx.Done()
-		if cmd.Process != nil {
+		if !processExited.Load() && cmd.Process != nil {
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 	}()
 
-	if err := cmd.Wait(); err != nil {
-		log.Printf("[Proxy] Non-stream run error: %v, stderr: %s", err, stderrBuf.String())
-		http.Error(w, fmt.Sprintf("AGY Error: %v: %s", err, stderrBuf.String()), http.StatusInternalServerError)
+	waitErr := cmd.Wait()
+	processExited.Store(true)
+
+	if waitErr != nil {
+		log.Printf("[Proxy] Non-stream run error: %v, stderr: %s", waitErr, stderrBuf.String())
+		http.Error(w, fmt.Sprintf("AGY Error: %v: %s", waitErr, stderrBuf.String()), http.StatusInternalServerError)
 		return
 	}
 
@@ -1057,13 +1090,24 @@ func handleNonStreamingCompletion(
 	if activeConvID != "" {
 		reasoning = extractReasoningFromTranscript(activeConvID)
 	}
-	if thinkMatches := thinkRegex.FindStringSubmatch(cleanText); len(thinkMatches) > 1 {
-		inThink := strings.TrimSpace(thinkMatches[1])
-		cleanText = strings.TrimSpace(thinkRegex.ReplaceAllString(cleanText, ""))
-		if reasoning != "" {
-			reasoning = reasoning + "\n\n" + inThink
-		} else {
-			reasoning = inThink
+	if thinkMatches := thinkRegex.FindAllStringSubmatch(cleanText, -1); len(thinkMatches) > 0 {
+		var thinkParts []string
+		for _, tm := range thinkMatches {
+			if len(tm) > 1 {
+				th := strings.TrimSpace(tm[1])
+				if th != "" {
+					thinkParts = append(thinkParts, th)
+				}
+			}
+		}
+		if len(thinkParts) > 0 {
+			allThink := strings.Join(thinkParts, "\n\n")
+			cleanText = strings.TrimSpace(thinkRegex.ReplaceAllString(cleanText, ""))
+			if reasoning != "" {
+				reasoning = reasoning + "\n\n" + allThink
+			} else {
+				reasoning = allThink
+			}
 		}
 	}
 
@@ -1172,7 +1216,7 @@ func main() {
 		Addr:         ":" + Port,
 		Handler:      mux,
 		ReadTimeout:  180 * time.Second,
-		WriteTimeout: 180 * time.Second,
+		WriteTimeout: 0, // Disabled for SSE streaming; request contexts manage timeouts
 		IdleTimeout:  300 * time.Second,
 	}
 
