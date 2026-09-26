@@ -584,10 +584,11 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionKey := extractSessionKey(req.Messages, r.Header)
+	// Only use an existing AGY conversation if explicitly requested by header.
+	// Hermes Agent is already stateful and sends the complete conversation history
+	// in req.Messages on every turn. Reusing AGY internal conversations causes
+	// duplicate history accumulation (800k+ tokens) leading to subscriber stall timeouts.
 	convID := r.Header.Get("X-Conversation-Id")
-	if convID == "" {
-		convID = getSessionID(sessionKey)
-	}
 
 	toolsPrompt := formatToolsPrompt(req.Tools)
 	finalPrompt := formatConversation(req.Messages, toolsPrompt)
