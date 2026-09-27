@@ -334,10 +334,11 @@ type ParsedToolCall struct {
 }
 
 var (
-	tagRegex      = regexp.MustCompile(`(?s)<(?:tool_call|function_call)>(.*?)</(?:tool_call|function_call)>`)
-	blockRegex    = regexp.MustCompile("(?s)```tool_call\\s*(.*?)\\s*```")
-	internalRegex = regexp.MustCompile(`call:(?:default_api:)?([a-zA-Z0-9_-]+)\{([^}]+)\}`)
-	thinkRegex    = regexp.MustCompile(`(?s)<(?:think|thought)>(.*?)</(?:think|thought)>`)
+	tagRegex        = regexp.MustCompile(`(?s)<(?:tool_call|function_call)>(.*?)</(?:tool_call|function_call)>`)
+	blockRegex      = regexp.MustCompile("(?s)```(?:tool_call|tool_code|json|python)?\\s*(?:<tool_call>)?\\s*({[\\s\\S]*?\"name\"\\s*:\\s*\"[^\"]+\"[\\s\\S]*?})\\s*(?:</tool_call>)?\\s*```")
+	bareToolRegex   = regexp.MustCompile(`(?s)(?:^|\n)\s*(?:tool_call|function_call):?\s*(\{\s*"name"\s*:\s*"[^"]+"[\s\S]*?\})`)
+	internalRegex   = regexp.MustCompile(`call:(?:default_api:)?([a-zA-Z0-9_-]+)\{([^}]+)\}`)
+	thinkRegex      = regexp.MustCompile(`(?s)<(?:think|thought)>(.*?)</(?:think|thought)>`)
 	toolCallCounter atomic.Uint64
 )
 
@@ -394,6 +395,26 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 	}
 	cleaned = blockRegex.ReplaceAllString(cleaned, "")
 
+	bareMatches := bareToolRegex.FindAllStringSubmatch(cleaned, -1)
+	for _, m := range bareMatches {
+		raw := strings.TrimSpace(m[1])
+		var single struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if err := json.Unmarshal([]byte(raw), &single); err == nil && single.Name != "" {
+			tc := ParsedToolCall{
+				Index: len(toolCalls),
+				ID:    nextToolCallID(),
+				Type:  "function",
+			}
+			tc.Function.Name = strings.TrimSpace(single.Name)
+			tc.Function.Arguments = normalizeArgs(single.Arguments)
+			toolCalls = append(toolCalls, tc)
+		}
+	}
+	cleaned = bareToolRegex.ReplaceAllString(cleaned, "")
+
 	iMatches := internalRegex.FindAllStringSubmatch(cleaned, -1)
 	for _, m := range iMatches {
 		tname := m[1]
@@ -410,6 +431,11 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 	cleaned = internalRegex.ReplaceAllString(cleaned, "")
 
 	cleanText = strings.TrimSpace(cleaned)
+	// When calling tools, any preamble monologue is model thinking/reasoning,
+	// never user-facing chat text. Clear cleanText so it does not leak to chat.
+	if len(toolCalls) > 0 {
+		cleanText = ""
+	}
 	return cleanText, toolCalls
 }
 
@@ -590,6 +616,56 @@ func handleModelInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func normalizeModel(m string) string {
+	if strings.Contains(m, "/") {
+		parts := strings.Split(m, "/")
+		m = parts[len(parts)-1]
+	}
+	m = strings.TrimPrefix(m, "custom:")
+	m = strings.TrimPrefix(m, "openai-")
+	m = strings.TrimSpace(strings.ToLower(m))
+
+	switch {
+	case m == "" || m == "auto" || m == "default":
+		return "gemini-3.8-flash-high"
+	case strings.Contains(m, "gemini-3.8-flash-medium"):
+		return "gemini-3.8-flash-medium"
+	case strings.Contains(m, "gemini-3.8-flash-low"):
+		return "gemini-3.8-flash-low"
+	case strings.Contains(m, "gemini-3.8") || strings.Contains(m, "flash-3.8"):
+		return "gemini-3.8-flash-high"
+	case strings.Contains(m, "gemini-3.7-flash-medium"):
+		return "gemini-3.7-flash-medium"
+	case strings.Contains(m, "gemini-3.7-flash-low"):
+		return "gemini-3.7-flash-low"
+	case strings.Contains(m, "gemini-3.7") || strings.Contains(m, "flash-3.7"):
+		return "gemini-3.7-flash-high"
+	case strings.Contains(m, "gemini-3.6-flash-medium"):
+		return "gemini-3.6-flash-medium"
+	case strings.Contains(m, "gemini-3.6-flash-low"):
+		return "gemini-3.6-flash-low"
+	case strings.Contains(m, "gemini-3.6") || strings.Contains(m, "flash-3.6"):
+		return "gemini-3.6-flash-high"
+	case strings.Contains(m, "gemini-3.1-pro-low"):
+		return "gemini-3.1-pro-low"
+	case strings.Contains(m, "gemini-3.1-pro") || strings.Contains(m, "pro-3.1"):
+		return "gemini-3.1-pro-high"
+	case strings.Contains(m, "opus"):
+		return "claude-opus-4-6-thinking"
+	case strings.Contains(m, "sonnet") || strings.Contains(m, "claude"):
+		return "claude-sonnet-4-6"
+	case strings.Contains(m, "gpt") || strings.Contains(m, "chatgpt"):
+		return "gpt-oss-120b-medium"
+	default:
+		for _, item := range fallbackModels {
+			if strings.EqualFold(item.ID, m) {
+				return item.ID
+			}
+		}
+		return "gemini-3.8-flash-high"
+	}
+}
+
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	reqCount.Add(1)
 
@@ -604,16 +680,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	model := req.Model
-	if strings.Contains(model, "/") {
-		parts := strings.Split(model, "/")
-		model = parts[len(parts)-1]
-	}
-	model = strings.TrimPrefix(model, "custom:")
-	model = strings.TrimSpace(model)
-	if model == "" || model == "auto" {
-		model = "gemini-3.8-flash-high"
-	}
+	model := normalizeModel(req.Model)
 
 	sessionKey := extractSessionKey(req.Messages, r.Header)
 	// Only use an existing AGY conversation if explicitly requested by header.
@@ -635,8 +702,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		lastMsgSummary = fmt.Sprintf("role=%s len=%d content=%q", lastMsg.Role, len(contentStr), contentStr[:limit])
 	}
-	log.Printf("[Proxy] Request #%d: model=%s stream=%v msgs=%d tools=%d promptLen=%d last=[%s]",
-		reqCount.Load(), model, req.Stream, len(req.Messages), len(req.Tools), len(finalPrompt), lastMsgSummary)
+	log.Printf("[Proxy] Request #%d: model=%s (orig: %s) stream=%v msgs=%d tools=%d promptLen=%d last=[%s]",
+		reqCount.Load(), model, req.Model, req.Stream, len(req.Messages), len(req.Tools), len(finalPrompt), lastMsgSummary)
 
 	createdTs := time.Now().Unix()
 	completionID := fmt.Sprintf("chatcmpl-agy-%d", createdTs)
@@ -659,8 +726,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	effort := req.ReasoningEffort
-	modelHasEffort := strings.HasSuffix(model, "-high") || strings.HasSuffix(model, "-medium") || strings.HasSuffix(model, "-low") || strings.HasSuffix(model, "-max")
-	if !modelHasEffort && effort != "" {
+	isGeminiBase := strings.HasPrefix(model, "gemini-") && !strings.HasSuffix(model, "-high") && !strings.HasSuffix(model, "-medium") && !strings.HasSuffix(model, "-low") && !strings.HasSuffix(model, "-max")
+	if isGeminiBase && effort != "" {
 		args = append(args, "--effort", effort)
 	}
 
@@ -669,7 +736,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		handleStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, convID, finalPrompt)
+		handleStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, convID, finalPrompt, len(req.Tools) > 0)
 	} else {
 		handleNonStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, convID, finalPrompt)
 	}
@@ -685,6 +752,7 @@ func handleStreamingCompletion(
 	completionID, model string,
 	createdTs int64,
 	sessionKey, initialConvID, finalPrompt string,
+	hasTools bool,
 ) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -894,13 +962,13 @@ func handleStreamingCompletion(
 				if delta != "" {
 					accumulatedText.WriteString(delta)
 
-					if strings.Contains(delta, "<tool_call>") || strings.Contains(delta, "<function_call>") || strings.Contains(delta, "call:") {
+					if strings.Contains(delta, "<tool_call>") || strings.Contains(delta, "<function_call>") || strings.Contains(delta, "call:") || strings.Contains(delta, "tool_call") {
 						isBufferingTool = true
 					}
 
-					if isBufferingTool {
-						toolBuffer.WriteString(delta)
-					} else {
+					// If tools are registered, buffer all output until agy finishes so we can cleanly
+					// parse tool calls and reasoning without leaking monologue or malformed JSON chunks!
+					if !hasTools && !isBufferingTool {
 						chunk := map[string]interface{}{
 							"id":      completionID,
 							"object":  "chat.completion.chunk",
@@ -930,6 +998,17 @@ func handleStreamingCompletion(
 			break
 		}
 		log.Printf("[Proxy] agy attempt %d failed (err=%v, stderr=%s)", attempt, lastWaitErr, lastStderr)
+		if strings.Contains(lastStderr, "--effort is not supported") {
+			var filteredArgs []string
+			for idx := 0; idx < len(args); idx++ {
+				if args[idx] == "--effort" {
+					idx++ // skip value too
+					continue
+				}
+				filteredArgs = append(filteredArgs, args[idx])
+			}
+			args = filteredArgs
+		}
 	}
 
 	if lastWaitErr != nil && accumulatedText.Len() == 0 {
@@ -987,8 +1066,8 @@ func handleStreamingCompletion(
 		writeSSE(fmt.Sprintf("data: %s\n\n", rb))
 	}
 
-	// Flush clean text buffered during tool call detection
-	if isBufferingTool && cleanText != "" {
+	// Flush clean text if tools were buffered or not streamed yet
+	if (isBufferingTool || hasTools) && cleanText != "" {
 		txtChunk := map[string]interface{}{
 			"id":      completionID,
 			"object":  "chat.completion.chunk",
@@ -1076,35 +1155,57 @@ func handleNonStreamingCompletion(
 	ctx, cancel := context.WithTimeout(r.Context(), DefaultTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, agyBin, args...)
-	cmd.Dir = workspaceDir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = append(os.Environ(), "PATH="+filepath.Join(os.Getenv("HOME"), ".local/bin")+":"+os.Getenv("PATH"))
-	cmd.Stdin = strings.NewReader(finalPrompt)
-
 	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
+	var waitErr error
 
-	if err := cmd.Start(); err != nil {
-		log.Printf("[Proxy] Non-stream start error: %v", err)
-		http.Error(w, fmt.Sprintf("AGY Error: %v", err), http.StatusInternalServerError)
-		return
+	for attempt := 1; attempt <= 2; attempt++ {
+		stdoutBuf.Reset()
+		stderrBuf.Reset()
+
+		cmd := exec.CommandContext(ctx, agyBin, args...)
+		cmd.Dir = workspaceDir
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Env = append(os.Environ(), "PATH="+filepath.Join(os.Getenv("HOME"), ".local/bin")+":"+os.Getenv("PATH"))
+		cmd.Stdin = strings.NewReader(finalPrompt)
+		cmd.Stdout = &stdoutBuf
+		cmd.Stderr = &stderrBuf
+
+		if err := cmd.Start(); err != nil {
+			log.Printf("[Proxy] Non-stream start error: %v", err)
+			http.Error(w, fmt.Sprintf("AGY Error: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		var processExited atomic.Bool
+		go func(c *exec.Cmd) {
+			<-ctx.Done()
+			if !processExited.Load() && c.Process != nil {
+				_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+			}
+		}(cmd)
+
+		waitErr = cmd.Wait()
+		processExited.Store(true)
+
+		if waitErr == nil {
+			break
+		}
+
+		log.Printf("[Proxy] Non-stream attempt %d failed (err=%v, stderr=%s)", attempt, waitErr, stderrBuf.String())
+		if strings.Contains(stderrBuf.String(), "--effort is not supported") {
+			var filteredArgs []string
+			for idx := 0; idx < len(args); idx++ {
+				if args[idx] == "--effort" {
+					idx++
+					continue
+				}
+				filteredArgs = append(filteredArgs, args[idx])
+			}
+			args = filteredArgs
+		}
 	}
 
-	var processExited atomic.Bool
-	go func() {
-		<-ctx.Done()
-		if !processExited.Load() && cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-	}()
-
-	waitErr := cmd.Wait()
-	processExited.Store(true)
-
 	if waitErr != nil {
-		log.Printf("[Proxy] Non-stream run error: %v, stderr: %s", waitErr, stderrBuf.String())
 		http.Error(w, fmt.Sprintf("AGY Error: %v: %s", waitErr, stderrBuf.String()), http.StatusInternalServerError)
 		return
 	}
