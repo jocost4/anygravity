@@ -266,7 +266,8 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 		sb.WriteString("\n\n")
 	}
 
-	for _, msg := range messages {
+	totalMsgs := len(messages)
+	for i, msg := range messages {
 		c := msg.ContentString()
 		switch msg.Role {
 		case "system":
@@ -298,6 +299,11 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 			toolName := msg.Name
 			if toolName == "" {
 				toolName = "tool"
+			}
+			// If tool result is historical (not in the last 4 messages) and large (> 4000 chars),
+			// truncate the middle to keep prompt size manageable and prevent gRPC stream stall.
+			if totalMsgs-i > 4 && len(c) > 4000 {
+				c = c[:2000] + "\n\n[... content truncated for brevity ...]\n\n" + c[len(c)-1000:]
 			}
 			sb.WriteString(fmt.Sprintf("[Tool Result for '%s']:\n%s\n\n", toolName, c))
 		}
@@ -619,6 +625,19 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	toolsPrompt := formatToolsPrompt(req.Tools)
 	finalPrompt := formatConversation(req.Messages, toolsPrompt)
 
+	lastMsgSummary := ""
+	if len(req.Messages) > 0 {
+		lastMsg := req.Messages[len(req.Messages)-1]
+		contentStr := lastMsg.ContentString()
+		limit := len(contentStr)
+		if limit > 80 {
+			limit = 80
+		}
+		lastMsgSummary = fmt.Sprintf("role=%s len=%d content=%q", lastMsg.Role, len(contentStr), contentStr[:limit])
+	}
+	log.Printf("[Proxy] Request #%d: model=%s stream=%v msgs=%d tools=%d promptLen=%d last=[%s]",
+		reqCount.Load(), model, req.Stream, len(req.Messages), len(req.Tools), len(finalPrompt), lastMsgSummary)
+
 	createdTs := time.Now().Unix()
 	completionID := fmt.Sprintf("chatcmpl-agy-%d", createdTs)
 
@@ -734,58 +753,6 @@ func handleStreamingCompletion(
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, agyBin, args...)
-	cmd.Dir = workspaceDir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = append(os.Environ(), "PATH="+filepath.Join(os.Getenv("HOME"), ".local/bin")+":"+os.Getenv("PATH"))
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		emitErrorSSE(fmt.Sprintf("StdinPipe error: %v", err))
-		return
-	}
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		emitErrorSSE(fmt.Sprintf("StdoutPipe error: %v", err))
-		return
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		emitErrorSSE(fmt.Sprintf("StderrPipe error: %v", err))
-		return
-	}
-
-	var stderrBuf bytes.Buffer
-	go func() {
-		_, _ = io.Copy(&stderrBuf, stderr)
-	}()
-
-	if err := cmd.Start(); err != nil {
-		log.Printf("[Proxy] Command start error: %v", err)
-		emitErrorSSE(fmt.Sprintf("Process start error: %v", err))
-		return
-	}
-
-	var processExited atomic.Bool
-	go func() {
-		<-ctx.Done()
-		if !processExited.Load() && cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		}
-	}()
-
-	// Stream prompt through StdinPipe in background
-	go func() {
-		defer stdin.Close()
-		_, _ = io.WriteString(stdin, finalPrompt)
-	}()
-
-	var accumulatedText strings.Builder
-	activeConvID := initialConvID
-	isBufferingTool := false
-	var toolBuffer strings.Builder
-
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -802,102 +769,173 @@ func handleStreamingCompletion(
 		}
 	}()
 
-	type streamEvent struct {
-		line []byte
-		err  error
-	}
-	eventChan := make(chan streamEvent, 4096)
+	var accumulatedText strings.Builder
+	activeConvID := initialConvID
+	isBufferingTool := false
+	var toolBuffer strings.Builder
+	var lastWaitErr error
+	var lastStderr string
 
-	go func() {
-		defer close(eventChan)
-		scanner := bufio.NewScanner(stdout)
-		buf := make([]byte, 1024*1024)
-		scanner.Buffer(buf, 1024*1024)
-		for scanner.Scan() {
-			raw := scanner.Bytes()
-			b := make([]byte, len(raw))
-			copy(b, raw)
-			eventChan <- streamEvent{line: b}
-		}
-		if err := scanner.Err(); err != nil {
-			eventChan <- streamEvent{err: err}
-		}
-	}()
-
-	for ev := range eventChan {
-		if ev.err != nil {
-			log.Printf("[Proxy] stdout scanner error: %v", ev.err)
-			continue
-		}
-		line := ev.line
-		if len(line) == 0 {
-			continue
+	for attempt := 1; attempt <= 2; attempt++ {
+		if attempt > 1 {
+			log.Printf("[Proxy] Retrying agy (attempt %d/2) for %s...", attempt, completionID)
+			accumulatedText.Reset()
+			toolBuffer.Reset()
+			isBufferingTool = false
+			time.Sleep(500 * time.Millisecond)
 		}
 
-		var event struct {
-			Event          string `json:"event"`
-			ConversationID string `json:"conversation_id"`
-			StepUpdate     struct {
-				TextDelta string `json:"text_delta"`
-			} `json:"step_update"`
-			Result struct {
+		cmd := exec.CommandContext(ctx, agyBin, args...)
+		cmd.Dir = workspaceDir
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Env = append(os.Environ(), "PATH="+filepath.Join(os.Getenv("HOME"), ".local/bin")+":"+os.Getenv("PATH"))
+
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			emitErrorSSE(fmt.Sprintf("StdinPipe error: %v", err))
+			return
+		}
+
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			emitErrorSSE(fmt.Sprintf("StdoutPipe error: %v", err))
+			return
+		}
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			emitErrorSSE(fmt.Sprintf("StderrPipe error: %v", err))
+			return
+		}
+
+		var stderrBuf bytes.Buffer
+		go func() {
+			_, _ = io.Copy(&stderrBuf, stderr)
+		}()
+
+		if err := cmd.Start(); err != nil {
+			log.Printf("[Proxy] Command start error: %v", err)
+			emitErrorSSE(fmt.Sprintf("Process start error: %v", err))
+			return
+		}
+
+		var processExited atomic.Bool
+		go func() {
+			<-ctx.Done()
+			if !processExited.Load() && cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+		}()
+
+		// Stream prompt through StdinPipe in background
+		go func() {
+			defer stdin.Close()
+			_, _ = io.WriteString(stdin, finalPrompt+"\n")
+		}()
+
+		type streamEvent struct {
+			line []byte
+			err  error
+		}
+		eventChan := make(chan streamEvent, 4096)
+
+		go func() {
+			defer close(eventChan)
+			scanner := bufio.NewScanner(stdout)
+			buf := make([]byte, 1024*1024)
+			scanner.Buffer(buf, 1024*1024)
+			for scanner.Scan() {
+				raw := scanner.Bytes()
+				b := make([]byte, len(raw))
+				copy(b, raw)
+				eventChan <- streamEvent{line: b}
+			}
+			if err := scanner.Err(); err != nil {
+				eventChan <- streamEvent{err: err}
+			}
+		}()
+
+		for ev := range eventChan {
+			if ev.err != nil {
+				log.Printf("[Proxy] stdout scanner error: %v", ev.err)
+				continue
+			}
+			line := ev.line
+			if len(line) == 0 {
+				continue
+			}
+
+			var event struct {
+				Event          string `json:"event"`
 				ConversationID string `json:"conversation_id"`
-			} `json:"result"`
-		}
-
-		if err := json.Unmarshal(line, &event); err != nil {
-			continue
-		}
-
-		if event.Event == "init" && event.ConversationID != "" {
-			activeConvID = event.ConversationID
-			if sessionKey != "" {
-				saveSessionMap(sessionKey, activeConvID)
+				StepUpdate     struct {
+					TextDelta string `json:"text_delta"`
+				} `json:"step_update"`
+				Result struct {
+					ConversationID string `json:"conversation_id"`
+				} `json:"result"`
 			}
-		} else if event.Event == "result" && event.Result.ConversationID != "" {
-			activeConvID = event.Result.ConversationID
-			if sessionKey != "" {
-				saveSessionMap(sessionKey, activeConvID)
-			}
-		} else if event.Event == "step_update" {
-			delta := event.StepUpdate.TextDelta
-			if delta != "" {
-				accumulatedText.WriteString(delta)
 
-				if strings.Contains(delta, "<tool_call>") || strings.Contains(delta, "<function_call>") || strings.Contains(delta, "call:") {
-					isBufferingTool = true
+			if err := json.Unmarshal(line, &event); err != nil {
+				continue
+			}
+
+			if event.Event == "init" && event.ConversationID != "" {
+				activeConvID = event.ConversationID
+				if sessionKey != "" {
+					saveSessionMap(sessionKey, activeConvID)
 				}
+			} else if event.Event == "result" && event.Result.ConversationID != "" {
+				activeConvID = event.Result.ConversationID
+				if sessionKey != "" {
+					saveSessionMap(sessionKey, activeConvID)
+				}
+			} else if event.Event == "step_update" {
+				delta := event.StepUpdate.TextDelta
+				if delta != "" {
+					accumulatedText.WriteString(delta)
 
-				if isBufferingTool {
-					toolBuffer.WriteString(delta)
-				} else {
-					chunk := map[string]interface{}{
-						"id":      completionID,
-						"object":  "chat.completion.chunk",
-						"created": createdTs,
-						"model":   model,
-						"choices": []map[string]interface{}{
-							{
-								"index":         0,
-								"delta":         map[string]interface{}{"content": delta},
-								"finish_reason": nil,
-							},
-						},
+					if strings.Contains(delta, "<tool_call>") || strings.Contains(delta, "<function_call>") || strings.Contains(delta, "call:") {
+						isBufferingTool = true
 					}
-					b, _ := json.Marshal(chunk)
-					writeSSE(fmt.Sprintf("data: %s\n\n", b))
+
+					if isBufferingTool {
+						toolBuffer.WriteString(delta)
+					} else {
+						chunk := map[string]interface{}{
+							"id":      completionID,
+							"object":  "chat.completion.chunk",
+							"created": createdTs,
+							"model":   model,
+							"choices": []map[string]interface{}{
+								{
+									"index":         0,
+									"delta":         map[string]interface{}{"content": delta},
+									"finish_reason": nil,
+								},
+							},
+						}
+						b, _ := json.Marshal(chunk)
+						writeSSE(fmt.Sprintf("data: %s\n\n", b))
+					}
 				}
 			}
 		}
+
+		lastWaitErr = cmd.Wait()
+		processExited.Store(true)
+		lastStderr = strings.TrimSpace(stderrBuf.String())
+
+		// If success or we got output, break retry loop
+		if lastWaitErr == nil || accumulatedText.Len() > 0 {
+			break
+		}
+		log.Printf("[Proxy] agy attempt %d failed (err=%v, stderr=%s)", attempt, lastWaitErr, lastStderr)
 	}
 
-	waitErr := cmd.Wait()
-	processExited.Store(true)
-
-	if waitErr != nil && accumulatedText.Len() == 0 {
-		errDetails := strings.TrimSpace(stderrBuf.String())
+	if lastWaitErr != nil && accumulatedText.Len() == 0 {
+		errDetails := lastStderr
 		if errDetails == "" {
-			errDetails = waitErr.Error()
+			errDetails = lastWaitErr.Error()
 		}
 		emitErrorSSE(errDetails)
 		return
