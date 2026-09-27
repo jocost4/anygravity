@@ -802,12 +802,34 @@ func handleStreamingCompletion(
 		}
 	}()
 
-	scanner := bufio.NewScanner(stdout)
-	buf := make([]byte, 1024*1024)
-	scanner.Buffer(buf, 1024*1024)
+	type streamEvent struct {
+		line []byte
+		err  error
+	}
+	eventChan := make(chan streamEvent, 4096)
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
+	go func() {
+		defer close(eventChan)
+		scanner := bufio.NewScanner(stdout)
+		buf := make([]byte, 1024*1024)
+		scanner.Buffer(buf, 1024*1024)
+		for scanner.Scan() {
+			raw := scanner.Bytes()
+			b := make([]byte, len(raw))
+			copy(b, raw)
+			eventChan <- streamEvent{line: b}
+		}
+		if err := scanner.Err(); err != nil {
+			eventChan <- streamEvent{err: err}
+		}
+	}()
+
+	for ev := range eventChan {
+		if ev.err != nil {
+			log.Printf("[Proxy] stdout scanner error: %v", ev.err)
+			continue
+		}
+		line := ev.line
 		if len(line) == 0 {
 			continue
 		}
@@ -867,10 +889,6 @@ func handleStreamingCompletion(
 				}
 			}
 		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		log.Printf("[Proxy] stdout scanner error: %v", err)
 	}
 
 	waitErr := cmd.Wait()
