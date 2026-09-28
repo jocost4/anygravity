@@ -5,7 +5,10 @@ After=network.target
 [Service]
 Type=exec
 User=ubuntu
+Environment=HOME=/home/ubuntu
 Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PORT=20130
+WorkingDirectory=/home/ubuntu
 ExecStart=/usr/local/bin/hermesgravity
 Restart=always
 RestartSec=3

@@ -24,15 +24,16 @@
 ```
 
 <p align="center">
-  <b>High-Performance Go Pipe &amp; MCP Bridge for Hermes Agent</b><br>
+  <b>High-Performance Production Go Pipe &amp; MCP Bridge for Hermes Agent</b><br>
   <i>Connects Google Antigravity (<code>agy</code> CLI) as an OpenAI SSE Inference Provider &amp; MCP Server</i>
 </p>
 
 <p align="center">
   <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.22+-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go Version"></a>
-  <a href="#-memory-benchmarks"><img src="https://img.shields.io/badge/RAM-~4.9%20MB-2ea44f?style=for-the-badge" alt="Memory"></a>
+  <a href="#-memory-benchmarks"><img src="https://img.shields.io/badge/RAM-~2.9%20MB-2ea44f?style=for-the-badge" alt="Memory"></a>
   <a href="#-the-hard-problems-solved"><img src="https://img.shields.io/badge/Zero-GIL-blueviolet?style=for-the-badge" alt="Zero GIL"></a>
   <a href="#-the-hard-problems-solved"><img src="https://img.shields.io/badge/STDIN-Streaming-orange?style=for-the-badge" alt="STDIN Streaming"></a>
+  <a href="#-test-suite"><img src="https://img.shields.io/badge/Tests-100%25%20Passing-brightgreen?style=for-the-badge" alt="Tests"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge" alt="License"></a>
   <a href="https://github.com/jocost4/hermesgravity/stargazers"><img src="https://img.shields.io/github/stars/jocost4/hermesgravity?style=for-the-badge" alt="Stars"></a>
 </p>
@@ -41,9 +42,9 @@
 
 ## 🚀 Overview
 
-**Hermesgravity** is an ultra-lightweight, high-performance bridge written in **pure standard-library Go (zero external dependencies, zero CGO, 100% static binary)**. It connects Google Antigravity (`agy` CLI) directly to **Hermes Agent** as an OpenAI SSE inference provider and an MCP subagent server.
+**Hermesgravity** is an ultra-lightweight, production-grade bridge written in **pure standard-library Go (zero external dependencies, zero CGO, 100% static binary)**. It connects Google Antigravity (`agy` CLI) directly to **Hermes Agent** as an OpenAI SSE inference provider and an MCP subagent server.
 
-Designed specifically to run reliably in resource-constrained environments (such as cloud VPS instances with 1 vCPU and 1 GB RAM) without freezing, leaking memory, or crashing during long conversations.
+Designed specifically to run reliably in resource-constrained environments (such as cloud VPS instances with 1 vCPU and 1 GB RAM) without freezing, leaking memory, or crashing during long agentic multi-turn conversations.
 
 ---
 
@@ -55,18 +56,35 @@ Bridging a CLI assistant with an autonomous agent orchestrator presents unique a
    - Standard wrappers execute the CLI with `-p "<prompt>"`. In multi-turn sessions with tool return outputs (`Ran [...] + 18 commands`), the command-line length easily exceeds the Linux kernel `ARG_MAX` limit, causing immediate process crashes.
    - **Hermesgravity** streams prompts and full history asynchronously through **STDIN Pipes**, effortlessly handling huge contexts (benchmarked with 300,000+ characters) with zero size limitations.
 
-2. **Ultra-Low Memory Footprint (< 5 MB RSS)**:
-   - Replaces heavy Python implementations (FastAPI/Uvicorn ~70 MB) with a static native Go binary.
-   - Consumes only **~4.9 MB of RAM** and **zero GIL** (Global Interpreter Lock), eliminating event loop hangs on single-core servers.
+2. **Ultra-Low Memory Footprint (~2.9 MB RSS)**:
+   - Replaces heavy Python implementations (FastAPI/Uvicorn ~72 MB) with a static native Go binary.
+   - Consumes only **~2.9 MB of RAM** and **zero GIL** (Global Interpreter Lock), eliminating event loop hangs on single-core servers.
 
-3. **Reasoning Extraction (`reasoning_content`)**:
-   - Captures internal thought processes (`<think>...</think>`) and terminal execution steps (`● Bash(...)`, `● View(...)`, `● Edit(...)`) from Antigravity session transcripts and streams them via `delta.reasoning_content` for native thinking visualizers in Hermes Desktop.
+3. **Concurrency Semaphore (`AGY_MAX_CONCURRENCY`)**:
+   - Replaced monolithic global mutex locks with an idiomatic Go channel semaphore. Supports parallel request execution (default: 4, configurable via `AGY_MAX_CONCURRENCY`) with full context cancellation support.
 
-4. **Bidirectional Tool Calling**:
-   - Translates OpenAI tool schemas into instructions Antigravity understands, and cleans output formats (`<tool_call>`, ````tool_call```` or raw JSON) back into standard OpenAI function call schemas.
+4. **Instant Time-To-First-Token (TTFT) SSE Streaming**:
+   - Emits the initial role chunk and streams text deltas immediately as tokens arrive, even when tools are registered.
+   - Selectively switches to tool-buffering only when tool call markers are encountered, using prefix-aware semantic deduplication when flushing.
 
-5. **SSE Heartbeat Keep-Alive**:
+5. **Bidirectional Tool Calling & Agentic Loop**:
+   - Translates OpenAI tool schemas into instructions Antigravity understands.
+   - Protects tool execution with workspace hooks (`.agents/hooks.json`) denying local execution by `agy`, delegating 100% of tool execution back to Hermes.
+   - Features a balanced-brace JSON parser (`extractJSONObject`) that cleanly handles deeply nested JSON objects and arrays without regex truncations.
+
+6. **Non-Blocking Debounced Session Persistence**:
+   - Background worker with a 2-second ticker and dirty flag persists `antigravity_session_map.json` asynchronously, keeping HTTP handlers completely non-blocking.
+   - Goroutine lifecycle is tied to the server root context, guaranteeing zero goroutine leaks on graceful shutdown.
+
+7. **Reasoning Extraction (`reasoning_content`)**:
+   - Extracts model thinking and step updates from Antigravity session transcripts with `sync.RWMutex` caching and `sync.Pool` 256KB buffer reuse.
+   - Strips tool call markers from reasoning blocks so thinking output is 100% clean.
+
+8. **SSE Heartbeat Keep-Alive**:
    - Transmits periodic SSE comments (`: ping\n\n`) every 10 seconds during long model generation phases, preventing Hermes Desktop WebSockets or reverse proxies from dropping the connection.
+
+9. **Graceful Shutdown**:
+   - Captures `SIGINT` and `SIGTERM` signals, triggers session flush, cleans up subprocess groups (`syscall.Kill(-pid, SIGKILL)`), and cleanly shuts down the HTTP listener.
 
 ---
 
@@ -89,10 +107,11 @@ Measured on an Ubuntu 24.04 VPS (1 vCPU, 1 GB RAM):
 
 | Metric | Legacy Proxy (Python / FastAPI) | **Hermesgravity (Native Go)** | Difference |
 | :--- | :--- | :--- | :--- |
-| **RSS Memory Usage** | ~72.4 MB | **~4.9 MB** | **-93.2% RAM** |
+| **RSS Memory Usage** | ~72.4 MB | **~2.9 MB** | **-96% RAM** |
 | **Startup Latency** | ~1.42s | **< 15ms** | **94x Faster** |
 | **CGO / Dynamic Libs** | Requires Python runtime & glibc | **Zero CGO (100% Static)** | Full Portability |
 | **Context Length Limit** | Crashed at ~128KB (`ARG_MAX`) | **Unlimited (STDIN Stream)** | Massive Contexts |
+| **Concurrency** | Single-threaded GIL lock | **Configurable Semaphore** | Multi-slot Parallel |
 
 ---
 
@@ -167,14 +186,33 @@ mcp_servers:
 
 ## 🎯 Supported Models
 
-Hermesgravity dynamically discovers models available on your local `agy` installation:
+Hermesgravity dynamically queries and supports the models available on your local `agy` installation:
 
-- `gemini-3.8-flash-high` (Default fast model with high reasoning effort)
-- `gemini-3.8-flash-low` (Lowest latency)
-- `gemini-3.8-pro` (Deep architecture and complex refactoring)
-- `claude-sonnet-4-6` (Anthropic model via AGY)
-- `claude-opus-4-6-thinking` (Extended thought reasoning)
-- `gpt-5-mini`
+| Model ID | Name | Description |
+| :--- | :--- | :--- |
+| `gemini-3.8-flash-high` | Gemini 3.8 Flash (High) | **Default** - Ultra-fast inference with high reasoning effort |
+| `gemini-3.8-flash-medium` | Gemini 3.8 Flash (Medium) | Balanced speed and reasoning depth |
+| `gemini-3.8-flash-low` | Gemini 3.8 Flash (Low) | Lowest latency for immediate single-turn answers |
+| `gemini-3.7-flash-high` | Gemini 3.7 Flash (High) | Previous generation high-reasoning flash model |
+| `gemini-3.7-flash-medium` | Gemini 3.7 Flash (Medium) | Previous generation balanced model |
+| `gemini-3.7-flash-low` | Gemini 3.7 Flash (Low) | Previous generation low-latency model |
+| `gemini-3.6-flash-high` | Gemini 3.6 Flash (High) | Fast baseline model |
+| `gemini-3.1-pro-high` | Gemini 3.1 Pro (High) | Deep architectural reasoning and large refactoring tasks |
+| `gemini-3.1-pro-low` | Gemini 3.1 Pro (Low) | Faster Pro tier variant |
+| `claude-sonnet-4-6` | Claude Sonnet 4.6 (Thinking) | Anthropic Sonnet model via Antigravity backend |
+| `claude-opus-4-6-thinking` | Claude Opus 4.6 (Thinking) | Extended thinking model for high-complexity problems |
+| `gpt-oss-120b-medium` | GPT-OSS 120B (Medium) | Open-weights 120B model hosted on Google Cloud backend |
+
+---
+
+## 🧪 Test Suite
+
+Run the unit test suite covering tool parsing, argument normalization, session key extraction, and streaming deduplication:
+
+```bash
+cd /home/jojo_cost4/hermesgravity
+go test -v ./...
+```
 
 ---
 

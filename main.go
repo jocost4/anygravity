@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -27,10 +28,17 @@ import (
 // Constants & Configuration
 // -----------------------------------------------------------------------------
 const (
-	Port           = "20130"
+	DefaultPort    = "20130"
 	Version        = "3.2-go"
 	DefaultTimeout = 180 * time.Second
 )
+
+func getPort() string {
+	if p := os.Getenv("PORT"); p != "" {
+		return p
+	}
+	return DefaultPort
+}
 
 var (
 	agyBin       = filepath.Join(os.Getenv("HOME"), ".local/bin/agy")
@@ -53,10 +61,12 @@ var (
 		{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B (Medium)"},
 	}
 
-	sessionMapFile = filepath.Join(os.Getenv("HOME"), ".hermes/antigravity_session_map.json")
-	sessionMu      sync.RWMutex
-	sessionCache   = make(map[string]string)
-	agyExecMu      sync.Mutex
+	sessionMapFile     = filepath.Join(os.Getenv("HOME"), ".hermes/antigravity_session_map.json")
+	sessionMu          sync.RWMutex
+	sessionCache       = make(map[string]string)
+	sessionSaveTrigger = make(chan struct{}, 1)
+
+	agySem = make(chan struct{}, getMaxConcurrency())
 
 	brainDirs = []string{
 		filepath.Join(os.Getenv("HOME"), ".gemini/antigravity-cli/brain"),
@@ -66,6 +76,16 @@ var (
 	startTime = time.Now()
 	reqCount  atomic.Uint64
 )
+
+func getMaxConcurrency() int {
+	if val := os.Getenv("AGY_MAX_CONCURRENCY"); val != "" {
+		var n int
+		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 4 // default 4 parallel execution slots
+}
 
 type ModelItem struct {
 	ID   string `json:"id"`
@@ -110,8 +130,32 @@ When a tool is needed, respond ONLY with:
 }
 
 // -----------------------------------------------------------------------------
-// Session Map Management
+// Session Map Management (Debounced & Non-Blocking Persistence)
 // -----------------------------------------------------------------------------
+func initSessionSaver(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		dirty := false
+		for {
+			select {
+			case <-sessionSaveTrigger:
+				dirty = true
+			case <-ticker.C:
+				if dirty {
+					flushSessionMap()
+					dirty = false
+				}
+			case <-ctx.Done():
+				if dirty {
+					flushSessionMap()
+				}
+				return
+			}
+		}
+	}()
+}
+
 func loadSessionMap() {
 	sessionMu.Lock()
 	defer sessionMu.Unlock()
@@ -121,12 +165,20 @@ func loadSessionMap() {
 	}
 }
 
+func flushSessionMap() {
+	sessionMu.RLock()
+	data, err := json.MarshalIndent(sessionCache, "", "  ")
+	sessionMu.RUnlock()
+	if err == nil {
+		_ = os.WriteFile(sessionMapFile, data, 0644)
+	}
+}
+
 func saveSessionMap(key, convID string) {
 	if key == "" || convID == "" {
 		return
 	}
 	sessionMu.Lock()
-	defer sessionMu.Unlock()
 	sessionCache[key] = convID
 	if len(sessionCache) > 1000 {
 		for k := range sessionCache {
@@ -136,9 +188,11 @@ func saveSessionMap(key, convID string) {
 			}
 		}
 	}
-	data, err := json.MarshalIndent(sessionCache, "", "  ")
-	if err == nil {
-		_ = os.WriteFile(sessionMapFile, data, 0644)
+	sessionMu.Unlock()
+
+	select {
+	case sessionSaveTrigger <- struct{}{}:
+	default:
 	}
 }
 
@@ -337,10 +391,46 @@ var (
 	tagRegex        = regexp.MustCompile(`(?s)<(?:tool_call|function_call)>(.*?)</(?:tool_call|function_call)>`)
 	blockRegex      = regexp.MustCompile("(?s)```(?:tool_call|tool_code|json|python)?\\s*(?:<tool_call>)?\\s*({[\\s\\S]*?\"name\"\\s*:\\s*\"[^\"]+\"[\\s\\S]*?})\\s*(?:</tool_call>)?\\s*```")
 	bareToolRegex   = regexp.MustCompile(`(?s)(?:^|\n)\s*(?:tool_call|function_call):?\s*(\{\s*"name"\s*:\s*"[^"]+"[\s\S]*?\})`)
+	bareMarkerRegex = regexp.MustCompile(`(?s)(?:^|\n)\s*(?:tool_call|function_call):?\s*\{`)
 	internalRegex   = regexp.MustCompile(`call:(?:default_api:)?([a-zA-Z0-9_-]+)\{([^}]+)\}`)
 	thinkRegex      = regexp.MustCompile(`(?s)<(?:think|thought)>(.*?)</(?:think|thought)>`)
 	toolCallCounter atomic.Uint64
 )
+
+func extractJSONObject(s string) (string, int) {
+	start := strings.Index(s, "{")
+	if start == -1 {
+		return "", -1
+	}
+	depth := 0
+	inString := false
+	escaped := false
+
+	for i := start; i < len(s); i++ {
+		ch := s[i]
+		if inString {
+			if escaped {
+				escaped = false
+			} else if ch == '\\' {
+				escaped = true
+			} else if ch == '"' {
+				inString = false
+			}
+		} else {
+			if ch == '"' {
+				inString = true
+			} else if ch == '{' {
+				depth++
+			} else if ch == '}' {
+				depth--
+				if depth == 0 {
+					return s[start : i+1], i + 1
+				}
+			}
+		}
+	}
+	return "", -1
+}
 
 func nextToolCallID() string {
 	n := toolCallCounter.Add(1)
@@ -395,14 +485,21 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 	}
 	cleaned = blockRegex.ReplaceAllString(cleaned, "")
 
-	bareMatches := bareToolRegex.FindAllStringSubmatch(cleaned, -1)
-	for _, m := range bareMatches {
-		raw := strings.TrimSpace(m[1])
+	for {
+		loc := bareMarkerRegex.FindStringIndex(cleaned)
+		if loc == nil {
+			break
+		}
+		braceIdx := loc[1] - 1
+		jsonStr, endOffset := extractJSONObject(cleaned[braceIdx:])
+		if endOffset == -1 {
+			break
+		}
 		var single struct {
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
 		}
-		if err := json.Unmarshal([]byte(raw), &single); err == nil && single.Name != "" {
+		if err := json.Unmarshal([]byte(jsonStr), &single); err == nil && single.Name != "" {
 			tc := ParsedToolCall{
 				Index: len(toolCalls),
 				ID:    nextToolCallID(),
@@ -412,8 +509,8 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 			tc.Function.Arguments = normalizeArgs(single.Arguments)
 			toolCalls = append(toolCalls, tc)
 		}
+		cleaned = cleaned[:loc[0]] + cleaned[braceIdx+endOffset:]
 	}
-	cleaned = bareToolRegex.ReplaceAllString(cleaned, "")
 
 	iMatches := internalRegex.FindAllStringSubmatch(cleaned, -1)
 	for _, m := range iMatches {
@@ -460,8 +557,26 @@ func normalizeArgs(raw json.RawMessage) string {
 }
 
 // -----------------------------------------------------------------------------
-// Transcript Reasoning & Tools Extractor
+// Transcript Reasoning & Tools Extractor (Cached & Heap-Optimized)
 // -----------------------------------------------------------------------------
+type transcriptCacheEntry struct {
+	modTime   time.Time
+	fileSize  int64
+	reasoning string
+}
+
+var (
+	tCacheMu sync.RWMutex
+	tCache   = make(map[string]transcriptCacheEntry)
+
+	scanBufPool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 256*1024)
+			return &b
+		},
+	}
+)
+
 func extractReasoningFromTranscript(convID string) string {
 	if convID == "" {
 		return ""
@@ -478,6 +593,19 @@ func extractReasoningFromTranscript(convID string) string {
 		return ""
 	}
 
+	fi, err := os.Stat(transcriptPath)
+	if err != nil {
+		return ""
+	}
+
+	tCacheMu.RLock()
+	cached, found := tCache[convID]
+	if found && cached.modTime.Equal(fi.ModTime()) && cached.fileSize == fi.Size() {
+		tCacheMu.RUnlock()
+		return cached.reasoning
+	}
+	tCacheMu.RUnlock()
+
 	f, err := os.Open(transcriptPath)
 	if err != nil {
 		return ""
@@ -488,8 +616,9 @@ func extractReasoningFromTranscript(convID string) string {
 	var thinkingBlocks []string
 
 	scanner := bufio.NewScanner(f)
-	buf := make([]byte, 1024*1024)
-	scanner.Buffer(buf, 1024*1024)
+	bufPtr := scanBufPool.Get().(*[]byte)
+	defer scanBufPool.Put(bufPtr)
+	scanner.Buffer(*bufPtr, 1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -509,7 +638,11 @@ func extractReasoningFromTranscript(convID string) string {
 			thinkingBlocks = thinkingBlocks[:0]
 		}
 		if th := strings.TrimSpace(entry.Thinking); th != "" {
-			thinkingBlocks = append(thinkingBlocks, th)
+			cleanTh, _ := parseToolCalls(th)
+			cleanTh = strings.TrimSpace(cleanTh)
+			if cleanTh != "" {
+				thinkingBlocks = append(thinkingBlocks, cleanTh)
+			}
 		}
 		for _, tc := range entry.ToolCalls {
 			switch tc.Name {
@@ -539,7 +672,25 @@ func extractReasoningFromTranscript(convID string) string {
 	if len(thinkingBlocks) > 0 {
 		parts = append(parts, strings.Join(thinkingBlocks, "\n\n"))
 	}
-	return strings.Join(parts, "\n\n")
+	res := strings.Join(parts, "\n\n")
+
+	tCacheMu.Lock()
+	if len(tCache) > 100 {
+		for k := range tCache {
+			delete(tCache, k)
+			if len(tCache) <= 50 {
+				break
+			}
+		}
+	}
+	tCache[convID] = transcriptCacheEntry{
+		modTime:   fi.ModTime(),
+		fileSize:  fi.Size(),
+		reasoning: res,
+	}
+	tCacheMu.Unlock()
+
+	return res
 }
 
 // -----------------------------------------------------------------------------
@@ -815,8 +966,13 @@ func handleStreamingCompletion(
 	initBytes, _ := json.Marshal(initChunk)
 	writeSSE(fmt.Sprintf("data: %s\n\n", initBytes))
 
-	agyExecMu.Lock()
-	defer agyExecMu.Unlock()
+	select {
+	case agySem <- struct{}{}:
+		defer func() { <-agySem }()
+	case <-r.Context().Done():
+		emitErrorSSE("Request canceled while waiting for execution slot")
+		return
+	}
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -838,9 +994,9 @@ func handleStreamingCompletion(
 	}()
 
 	var accumulatedText strings.Builder
+	var streamedText strings.Builder
 	activeConvID := initialConvID
 	isBufferingTool := false
-	var toolBuffer strings.Builder
 	var lastWaitErr error
 	var lastStderr string
 
@@ -848,7 +1004,7 @@ func handleStreamingCompletion(
 		if attempt > 1 {
 			log.Printf("[Proxy] Retrying agy (attempt %d/2) for %s...", attempt, completionID)
 			accumulatedText.Reset()
-			toolBuffer.Reset()
+			streamedText.Reset()
 			isBufferingTool = false
 			time.Sleep(500 * time.Millisecond)
 		}
@@ -962,28 +1118,42 @@ func handleStreamingCompletion(
 				if delta != "" {
 					accumulatedText.WriteString(delta)
 
-					if strings.Contains(delta, "<tool_call>") || strings.Contains(delta, "<function_call>") || strings.Contains(delta, "call:") || strings.Contains(delta, "tool_call") {
-						isBufferingTool = true
-					}
-
-					// If tools are registered, buffer all output until agy finishes so we can cleanly
-					// parse tool calls and reasoning without leaking monologue or malformed JSON chunks!
-					if !hasTools && !isBufferingTool {
-						chunk := map[string]interface{}{
-							"id":      completionID,
-							"object":  "chat.completion.chunk",
-							"created": createdTs,
-							"model":   model,
-							"choices": []map[string]interface{}{
-								{
-									"index":         0,
-									"delta":         map[string]interface{}{"content": delta},
-									"finish_reason": nil,
-								},
-							},
+					if !isBufferingTool {
+						// Look for tool call marker in this delta
+						toolMarkerIdx := -1
+						markers := []string{"<tool_call>", "<function_call>", "call:", "tool_call"}
+						for _, m := range markers {
+							if idx := strings.Index(delta, m); idx != -1 {
+								if toolMarkerIdx == -1 || idx < toolMarkerIdx {
+									toolMarkerIdx = idx
+								}
+							}
 						}
-						b, _ := json.Marshal(chunk)
-						writeSSE(fmt.Sprintf("data: %s\n\n", b))
+
+						toStream := delta
+						if toolMarkerIdx != -1 {
+							toStream = delta[:toolMarkerIdx]
+							isBufferingTool = true
+						}
+
+						if toStream != "" {
+							streamedText.WriteString(toStream)
+							chunk := map[string]interface{}{
+								"id":      completionID,
+								"object":  "chat.completion.chunk",
+								"created": createdTs,
+								"model":   model,
+								"choices": []map[string]interface{}{
+									{
+										"index":         0,
+										"delta":         map[string]interface{}{"content": toStream},
+										"finish_reason": nil,
+									},
+								},
+							}
+							b, _ := json.Marshal(chunk)
+							writeSSE(fmt.Sprintf("data: %s\n\n", b))
+						}
 					}
 				}
 			}
@@ -1066,8 +1236,20 @@ func handleStreamingCompletion(
 		writeSSE(fmt.Sprintf("data: %s\n\n", rb))
 	}
 
-	// Flush clean text if tools were buffered or not streamed yet
-	if (isBufferingTool || hasTools) && cleanText != "" {
+	// Flush remaining clean text if not streamed yet
+	unstreamed := cleanText
+	alreadyStreamed := streamedText.String()
+	if alreadyStreamed != "" {
+		if strings.HasPrefix(cleanText, alreadyStreamed) {
+			unstreamed = strings.TrimPrefix(cleanText, alreadyStreamed)
+		} else if strings.Contains(cleanText, alreadyStreamed) {
+			idx := strings.Index(cleanText, alreadyStreamed)
+			unstreamed = cleanText[idx+len(alreadyStreamed):]
+		} else {
+			unstreamed = ""
+		}
+	}
+	if unstreamed != "" {
 		txtChunk := map[string]interface{}{
 			"id":      completionID,
 			"object":  "chat.completion.chunk",
@@ -1076,7 +1258,7 @@ func handleStreamingCompletion(
 			"choices": []map[string]interface{}{
 				{
 					"index":         0,
-					"delta":         map[string]interface{}{"content": cleanText},
+					"delta":         map[string]interface{}{"content": unstreamed},
 					"finish_reason": nil,
 				},
 			},
@@ -1149,8 +1331,13 @@ func handleNonStreamingCompletion(
 	createdTs int64,
 	sessionKey, initialConvID, finalPrompt string,
 ) {
-	agyExecMu.Lock()
-	defer agyExecMu.Unlock()
+	select {
+	case agySem <- struct{}{}:
+		defer func() { <-agySem }()
+	case <-r.Context().Done():
+		http.Error(w, "Request canceled while waiting for execution slot", http.StatusRequestTimeout)
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), DefaultTimeout)
 	defer cancel()
@@ -1359,6 +1546,10 @@ func main() {
 	initWorkspace()
 	loadSessionMap()
 
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+	initSessionSaver(rootCtx)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /metrics", handleMetrics)
@@ -1369,16 +1560,30 @@ func main() {
 	mux.HandleFunc("POST /api/show", handleOllamaShow)
 	mux.HandleFunc("GET /api/tags", handleOllamaTags)
 
+	port := getPort()
 	server := &http.Server{
-		Addr:         ":" + Port,
+		Addr:         ":" + port,
 		Handler:      mux,
 		ReadTimeout:  180 * time.Second,
 		WriteTimeout: 0, // Disabled for SSE streaming; request contexts manage timeouts
 		IdleTimeout:  300 * time.Second,
 	}
 
-	log.Printf("[Hermesgravity] Service listening on :%s (RSS: ~4.9MB)", Port)
-	if err := server.ListenAndServe(); err != nil {
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-stop
+		log.Println("[Hermesgravity] Shutting down gracefully...")
+		rootCancel()
+		flushSessionMap()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+	}()
+
+	log.Printf("[Hermesgravity] Service listening on :%s (RSS: ~4.9MB)", port)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server error: %v", err)
 	}
 }
