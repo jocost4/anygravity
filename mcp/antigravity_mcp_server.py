@@ -130,7 +130,6 @@ def create_server() -> MCPServer:
         if effort and not model_has_effort:
             cmd.extend(["--effort", effort.strip()])
 
-        cmd.extend(["-p", prompt])
         workdir = cwd.strip() if cwd and os.path.isdir(cwd.strip()) else os.getcwd()
 
         proc_env = dict(os.environ)
@@ -142,6 +141,7 @@ def create_server() -> MCPServer:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=workdir,
@@ -149,7 +149,7 @@ def create_server() -> MCPServer:
             )
 
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=float(timeout_seconds)
+                proc.communicate(input=(prompt + "\n").encode("utf-8")), timeout=float(timeout_seconds)
             )
 
             stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
@@ -227,7 +227,6 @@ def create_server() -> MCPServer:
         if effort and not model_has_effort:
             cmd.extend(["--effort", effort.strip()])
 
-        cmd.extend(["-p", prompt])
         workdir = cwd.strip() if cwd and os.path.isdir(cwd.strip()) else os.getcwd()
 
         proc_env = dict(os.environ)
@@ -239,6 +238,7 @@ def create_server() -> MCPServer:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=workdir,
@@ -246,7 +246,7 @@ def create_server() -> MCPServer:
             )
 
             stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=float(timeout_seconds)
+                proc.communicate(input=(prompt + "\n").encode("utf-8")), timeout=float(timeout_seconds)
             )
             stdout = stdout_b.decode("utf-8", errors="replace").strip()
             stderr = stderr_b.decode("utf-8", errors="replace").strip()
@@ -301,7 +301,6 @@ def create_server() -> MCPServer:
             "--mode", mode,
             "--dangerously-skip-permissions",
             "--model", model,
-            "-p", f"You are a Principal Software Engineer. Execute this task meticulously:\n\n{task}",
         ]
         workdir = workspace.strip() if workspace and os.path.isdir(workspace.strip()) else os.getcwd()
 
@@ -310,17 +309,19 @@ def create_server() -> MCPServer:
         if local_bin not in proc_env.get("PATH", ""):
             proc_env["PATH"] = f"{local_bin}:{proc_env.get('PATH', '')}"
 
+        agent_prompt = f"You are a Principal Software Engineer. Execute this task meticulously:\n\n{task}\n"
         proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=workdir,
                 env=proc_env,
             )
             stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=float(timeout_seconds)
+                proc.communicate(input=agent_prompt.encode("utf-8")), timeout=float(timeout_seconds)
             )
             stdout = stdout_b.decode("utf-8", errors="replace").strip()
             stderr = stderr_b.decode("utf-8", errors="replace").strip()
@@ -371,7 +372,6 @@ def create_server() -> MCPServer:
             "--mode", "plan",
             "--dangerously-skip-permissions",
             "--model", model,
-            "-p", prompt,
         ]
 
         proc_env = dict(os.environ)
@@ -383,12 +383,13 @@ def create_server() -> MCPServer:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=proc_env,
             )
             stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=float(timeout_seconds)
+                proc.communicate(input=(prompt + "\n").encode("utf-8")), timeout=float(timeout_seconds)
             )
             stdout = stdout_b.decode("utf-8", errors="replace").strip()
             stderr = stderr_b.decode("utf-8", errors="replace").strip()

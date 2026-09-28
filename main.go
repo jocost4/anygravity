@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -28,16 +30,32 @@ import (
 // Constants & Configuration
 // -----------------------------------------------------------------------------
 const (
+	DefaultHost    = "127.0.0.1"
 	DefaultPort    = "20130"
-	Version        = "3.2-go"
+	Version        = "3.3-go"
 	DefaultTimeout = 180 * time.Second
+	StreamTimeout  = 600 * time.Second
 )
+
+func getHost() string {
+	if h := os.Getenv("HOST"); h != "" {
+		return h
+	}
+	return DefaultHost
+}
 
 func getPort() string {
 	if p := os.Getenv("PORT"); p != "" {
 		return p
 	}
 	return DefaultPort
+}
+
+func getAPIKey() string {
+	if k := os.Getenv("HERMESGRAVITY_API_KEY"); k != "" {
+		return k
+	}
+	return os.Getenv("API_KEY")
 }
 
 var (
@@ -60,11 +78,6 @@ var (
 		{ID: "claude-opus-4-6-thinking", Name: "Claude Opus 4.6 (Thinking)"},
 		{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B (Medium)"},
 	}
-
-	sessionMapFile     = filepath.Join(os.Getenv("HOME"), ".hermes/antigravity_session_map.json")
-	sessionMu          sync.RWMutex
-	sessionCache       = make(map[string]string)
-	sessionSaveTrigger = make(chan struct{}, 1)
 
 	agySem = make(chan struct{}, getMaxConcurrency())
 
@@ -130,77 +143,8 @@ When a tool is needed, respond ONLY with:
 }
 
 // -----------------------------------------------------------------------------
-// Session Map Management (Debounced & Non-Blocking Persistence)
+// Request Metadata & Session Key Extractor
 // -----------------------------------------------------------------------------
-func initSessionSaver(ctx context.Context) {
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		dirty := false
-		for {
-			select {
-			case <-sessionSaveTrigger:
-				dirty = true
-			case <-ticker.C:
-				if dirty {
-					flushSessionMap()
-					dirty = false
-				}
-			case <-ctx.Done():
-				if dirty {
-					flushSessionMap()
-				}
-				return
-			}
-		}
-	}()
-}
-
-func loadSessionMap() {
-	sessionMu.Lock()
-	defer sessionMu.Unlock()
-	data, err := os.ReadFile(sessionMapFile)
-	if err == nil {
-		_ = json.Unmarshal(data, &sessionCache)
-	}
-}
-
-func flushSessionMap() {
-	sessionMu.RLock()
-	data, err := json.MarshalIndent(sessionCache, "", "  ")
-	sessionMu.RUnlock()
-	if err == nil {
-		_ = os.WriteFile(sessionMapFile, data, 0644)
-	}
-}
-
-func saveSessionMap(key, convID string) {
-	if key == "" || convID == "" {
-		return
-	}
-	sessionMu.Lock()
-	sessionCache[key] = convID
-	if len(sessionCache) > 1000 {
-		for k := range sessionCache {
-			delete(sessionCache, k)
-			if len(sessionCache) <= 800 {
-				break
-			}
-		}
-	}
-	sessionMu.Unlock()
-
-	select {
-	case sessionSaveTrigger <- struct{}{}:
-	default:
-	}
-}
-
-func getSessionID(key string) string {
-	sessionMu.RLock()
-	defer sessionMu.RUnlock()
-	return sessionCache[key]
-}
 
 func extractSessionKey(messages []ChatMessage, headers http.Header) string {
 	for _, h := range []string{"X-Session-Id", "X-Conversation-Id", "X-Hermes-Session-Id"} {
@@ -759,15 +703,31 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 
 func handleModelInfo(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/v1/models/")
+	id = strings.TrimSpace(id)
+	for _, m := range registry.GetModels() {
+		if strings.EqualFold(m.ID, id) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":       m.ID,
+				"object":   "model",
+				"owned_by": "antigravity",
+				"name":     m.Name,
+			})
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"id":       id,
-		"object":   "model",
-		"owned_by": "antigravity",
+		"error": map[string]string{
+			"message": fmt.Sprintf("Model %q not found", id),
+			"type":    "invalid_request_error",
+			"code":    "model_not_found",
+		},
 	})
 }
 
-func normalizeModel(m string) string {
+func resolveModel(m string) (string, error) {
 	if strings.Contains(m, "/") {
 		parts := strings.Split(m, "/")
 		m = parts[len(parts)-1]
@@ -776,44 +736,47 @@ func normalizeModel(m string) string {
 	m = strings.TrimPrefix(m, "openai-")
 	m = strings.TrimSpace(strings.ToLower(m))
 
-	switch {
-	case m == "" || m == "auto" || m == "default":
-		return "gemini-3.8-flash-high"
-	case strings.Contains(m, "gemini-3.8-flash-medium"):
-		return "gemini-3.8-flash-medium"
-	case strings.Contains(m, "gemini-3.8-flash-low"):
-		return "gemini-3.8-flash-low"
-	case strings.Contains(m, "gemini-3.8") || strings.Contains(m, "flash-3.8"):
-		return "gemini-3.8-flash-high"
-	case strings.Contains(m, "gemini-3.7-flash-medium"):
-		return "gemini-3.7-flash-medium"
-	case strings.Contains(m, "gemini-3.7-flash-low"):
-		return "gemini-3.7-flash-low"
-	case strings.Contains(m, "gemini-3.7") || strings.Contains(m, "flash-3.7"):
-		return "gemini-3.7-flash-high"
-	case strings.Contains(m, "gemini-3.6-flash-medium"):
-		return "gemini-3.6-flash-medium"
-	case strings.Contains(m, "gemini-3.6-flash-low"):
-		return "gemini-3.6-flash-low"
-	case strings.Contains(m, "gemini-3.6") || strings.Contains(m, "flash-3.6"):
-		return "gemini-3.6-flash-high"
-	case strings.Contains(m, "gemini-3.1-pro-low"):
-		return "gemini-3.1-pro-low"
-	case strings.Contains(m, "gemini-3.1-pro") || strings.Contains(m, "pro-3.1"):
-		return "gemini-3.1-pro-high"
-	case strings.Contains(m, "opus"):
-		return "claude-opus-4-6-thinking"
-	case strings.Contains(m, "sonnet") || strings.Contains(m, "claude"):
-		return "claude-sonnet-4-6"
-	case strings.Contains(m, "gpt") || strings.Contains(m, "chatgpt"):
-		return "gpt-oss-120b-medium"
-	default:
-		for _, item := range fallbackModels {
-			if strings.EqualFold(item.ID, m) {
-				return item.ID
-			}
+	if m == "" || m == "auto" || m == "default" {
+		return "gemini-3.8-flash-high", nil
+	}
+
+	for _, item := range registry.GetModels() {
+		if strings.EqualFold(item.ID, m) {
+			return item.ID, nil
 		}
-		return "gemini-3.8-flash-high"
+	}
+
+	switch {
+	case strings.Contains(m, "gemini-3.8-flash-medium"):
+		return "gemini-3.8-flash-medium", nil
+	case strings.Contains(m, "gemini-3.8-flash-low"):
+		return "gemini-3.8-flash-low", nil
+	case strings.Contains(m, "gemini-3.8") || strings.Contains(m, "flash-3.8"):
+		return "gemini-3.8-flash-high", nil
+	case strings.Contains(m, "gemini-3.7-flash-medium"):
+		return "gemini-3.7-flash-medium", nil
+	case strings.Contains(m, "gemini-3.7-flash-low"):
+		return "gemini-3.7-flash-low", nil
+	case strings.Contains(m, "gemini-3.7") || strings.Contains(m, "flash-3.7"):
+		return "gemini-3.7-flash-high", nil
+	case strings.Contains(m, "gemini-3.6-flash-medium"):
+		return "gemini-3.6-flash-medium", nil
+	case strings.Contains(m, "gemini-3.6-flash-low"):
+		return "gemini-3.6-flash-low", nil
+	case strings.Contains(m, "gemini-3.6") || strings.Contains(m, "flash-3.6"):
+		return "gemini-3.6-flash-high", nil
+	case strings.Contains(m, "gemini-3.1-pro-low"):
+		return "gemini-3.1-pro-low", nil
+	case strings.Contains(m, "gemini-3.1-pro") || strings.Contains(m, "pro-3.1"):
+		return "gemini-3.1-pro-high", nil
+	case strings.Contains(m, "opus"):
+		return "claude-opus-4-6-thinking", nil
+	case strings.Contains(m, "sonnet") || strings.Contains(m, "claude"):
+		return "claude-sonnet-4-6", nil
+	case strings.Contains(m, "gpt-oss") || m == "gpt-oss-120b":
+		return "gpt-oss-120b-medium", nil
+	default:
+		return "", fmt.Errorf("unsupported model: %s", m)
 	}
 }
 
@@ -821,17 +784,49 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	reqCount.Add(1)
 
 	var req ChatCompletionRequest
-	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, "Invalid body", http.StatusBadRequest)
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]string{
+					"message": "Request payload too large (max 10MB)",
+					"type":    "invalid_request_error",
+				},
+			})
+			return
+		}
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
 		return
 	}
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
-		http.Error(w, "Malformed JSON", http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]string{
+				"message": fmt.Sprintf("Malformed JSON: %v", err),
+				"type":    "invalid_request_error",
+			},
+		})
 		return
 	}
 
-	model := normalizeModel(req.Model)
+	model, err := resolveModel(req.Model)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]string{
+				"message": err.Error(),
+				"type":    "invalid_request_error",
+				"code":    "model_not_found",
+			},
+		})
+		return
+	}
 
 	sessionKey := extractSessionKey(req.Messages, r.Header)
 	// Only use an existing AGY conversation if explicitly requested by header.
@@ -974,8 +969,26 @@ func handleStreamingCompletion(
 		return
 	}
 
-	ctx, cancel := context.WithCancel(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), StreamTimeout)
 	defer cancel()
+
+	emitTextChunk := func(txt string) {
+		chunk := map[string]interface{}{
+			"id":      completionID,
+			"object":  "chat.completion.chunk",
+			"created": createdTs,
+			"model":   model,
+			"choices": []map[string]interface{}{
+				{
+					"index":         0,
+					"delta":         map[string]interface{}{"content": txt},
+					"finish_reason": nil,
+				},
+			},
+		}
+		b, _ := json.Marshal(chunk)
+		writeSSE(fmt.Sprintf("data: %s\n\n", b))
+	}
 
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -995,6 +1008,7 @@ func handleStreamingCompletion(
 
 	var accumulatedText strings.Builder
 	var streamedText strings.Builder
+	var streamPending strings.Builder
 	activeConvID := initialConvID
 	isBufferingTool := false
 	var lastWaitErr error
@@ -1005,6 +1019,7 @@ func handleStreamingCompletion(
 			log.Printf("[Proxy] Retrying agy (attempt %d/2) for %s...", attempt, completionID)
 			accumulatedText.Reset()
 			streamedText.Reset()
+			streamPending.Reset()
 			isBufferingTool = false
 			time.Sleep(500 * time.Millisecond)
 		}
@@ -1105,58 +1120,81 @@ func handleStreamingCompletion(
 
 			if event.Event == "init" && event.ConversationID != "" {
 				activeConvID = event.ConversationID
-				if sessionKey != "" {
-					saveSessionMap(sessionKey, activeConvID)
-				}
 			} else if event.Event == "result" && event.Result.ConversationID != "" {
 				activeConvID = event.Result.ConversationID
-				if sessionKey != "" {
-					saveSessionMap(sessionKey, activeConvID)
-				}
 			} else if event.Event == "step_update" {
 				delta := event.StepUpdate.TextDelta
 				if delta != "" {
 					accumulatedText.WriteString(delta)
 
 					if !isBufferingTool {
-						// Look for tool call marker in this delta
-						toolMarkerIdx := -1
+						streamPending.WriteString(delta)
+						pending := streamPending.String()
+
+						// 1. Check if any complete tool marker is present
 						markers := []string{"<tool_call>", "<function_call>", "call:", "tool_call"}
+						toolMarkerIdx := -1
 						for _, m := range markers {
-							if idx := strings.Index(delta, m); idx != -1 {
+							if idx := strings.Index(pending, m); idx != -1 {
 								if toolMarkerIdx == -1 || idx < toolMarkerIdx {
 									toolMarkerIdx = idx
 								}
 							}
 						}
 
-						toStream := delta
 						if toolMarkerIdx != -1 {
-							toStream = delta[:toolMarkerIdx]
-							isBufferingTool = true
-						}
-
-						if toStream != "" {
-							streamedText.WriteString(toStream)
-							chunk := map[string]interface{}{
-								"id":      completionID,
-								"object":  "chat.completion.chunk",
-								"created": createdTs,
-								"model":   model,
-								"choices": []map[string]interface{}{
-									{
-										"index":         0,
-										"delta":         map[string]interface{}{"content": toStream},
-										"finish_reason": nil,
-									},
-								},
+							// Found tool marker! Stream any text before the marker, then activate tool buffering.
+							toEmit := pending[:toolMarkerIdx]
+							if toEmit != "" {
+								streamedText.WriteString(toEmit)
+								emitTextChunk(toEmit)
 							}
-							b, _ := json.Marshal(chunk)
-							writeSSE(fmt.Sprintf("data: %s\n\n", b))
+							isBufferingTool = true
+							streamPending.Reset()
+						} else {
+							// 2. Check if trailing suffix matches an incomplete prefix of a tool marker
+							splitIdx := len(pending)
+							const maxMarkerLen = 16
+							maxK := len(pending)
+							if maxK > maxMarkerLen {
+								maxK = maxMarkerLen
+							}
+							foundPrefix := false
+							for k := maxK; k > 0; k-- {
+								suffix := pending[len(pending)-k:]
+								for _, m := range markers {
+									if strings.HasPrefix(m, suffix) {
+										splitIdx = len(pending) - k
+										foundPrefix = true
+										break
+									}
+								}
+								if foundPrefix {
+									break
+								}
+							}
+
+							toEmit := pending[:splitIdx]
+							toHold := pending[splitIdx:]
+
+							if toEmit != "" {
+								streamedText.WriteString(toEmit)
+								emitTextChunk(toEmit)
+							}
+							streamPending.Reset()
+							streamPending.WriteString(toHold)
 						}
 					}
 				}
 			}
+		}
+
+		// Flush any pending text if no tool call was encountered
+		if !isBufferingTool && streamPending.Len() > 0 {
+			remaining := streamPending.String()
+			streamedText.WriteString(remaining)
+			emitTextChunk(remaining)
+			streamPending.Reset()
 		}
 
 		lastWaitErr = cmd.Wait()
@@ -1420,9 +1458,6 @@ func handleNonStreamingCompletion(
 	if activeConvID == "" {
 		activeConvID = initialConvID
 	}
-	if activeConvID != "" && sessionKey != "" {
-		saveSessionMap(sessionKey, activeConvID)
-	}
 
 	cleanText, toolCalls := parseToolCalls(respText)
 	finishReason := "stop"
@@ -1542,13 +1577,39 @@ func handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 // -----------------------------------------------------------------------------
 // Main Entrypoint
 // -----------------------------------------------------------------------------
+func authMiddleware(next http.Handler) http.Handler {
+	apiKey := getAPIKey()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Health endpoint is public for local probing
+		if r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if apiKey != "" {
+			authHeader := r.Header.Get("Authorization")
+			token := strings.TrimPrefix(authHeader, "Bearer ")
+			token = strings.TrimSpace(token)
+			if token != apiKey {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"error": map[string]string{
+						"message": "Unauthorized: Invalid or missing API key",
+						"type":    "auth_error",
+						"code":    "invalid_api_key",
+					},
+				})
+				return
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	initWorkspace()
-	loadSessionMap()
-
-	rootCtx, rootCancel := context.WithCancel(context.Background())
-	defer rootCancel()
-	initSessionSaver(rootCtx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
@@ -1560,10 +1621,19 @@ func main() {
 	mux.HandleFunc("POST /api/show", handleOllamaShow)
 	mux.HandleFunc("GET /api/tags", handleOllamaTags)
 
+	handler := authMiddleware(mux)
+
+	host := getHost()
 	port := getPort()
+	addr := net.JoinHostPort(host, port)
+
+	if (host == "0.0.0.0" || host == "") && getAPIKey() == "" {
+		log.Printf("[SECURITY WARNING] Server is binding to all interfaces (%s) without HERMESGRAVITY_API_KEY! Set HERMESGRAVITY_API_KEY to protect your machine.", addr)
+	}
+
 	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      mux,
+		Addr:         addr,
+		Handler:      handler,
 		ReadTimeout:  180 * time.Second,
 		WriteTimeout: 0, // Disabled for SSE streaming; request contexts manage timeouts
 		IdleTimeout:  300 * time.Second,
@@ -1575,14 +1645,12 @@ func main() {
 	go func() {
 		<-stop
 		log.Println("[Hermesgravity] Shutting down gracefully...")
-		rootCancel()
-		flushSessionMap()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(ctx)
 	}()
 
-	log.Printf("[Hermesgravity] Service listening on :%s (RSS: ~4.9MB)", port)
+	log.Printf("[Hermesgravity] Service listening on http://%s (RSS: ~2.9MB)", addr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server error: %v", err)
 	}
