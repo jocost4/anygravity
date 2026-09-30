@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Antigravity MCP Server for Hermes Agent (v3.0 - Ultimate Edition).
+Antigravity MCP Server for Any AI Agent (v3.0 - Universal Edition).
 Runs natively inside WSL/Linux, exposing Antigravity's complete suite of tools,
-specialized subagents, agent modes, skills, artifacts, and context directly to Hermes.
+specialized subagents, agent modes, skills, artifacts, and context directly to
+any MCP-compatible AI agent (Hermes, Claude Desktop, Cursor, OpenCode, etc.).
 
 Key Features:
 - Subagent Tools: agy_run_code_agent, agy_run_research_agent, agy_discover.

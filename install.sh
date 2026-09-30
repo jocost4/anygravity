@@ -2,7 +2,7 @@
 set -euo pipefail
 
 echo "=========================================================="
-echo "  Anygravity - Antigravity to Hermes Agent Pipe Setup"
+echo "  Anygravity - Antigravity to Any AI Agent Pipe Setup"
 echo "=========================================================="
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

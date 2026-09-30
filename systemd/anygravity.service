@@ -1,5 +1,5 @@
 [Unit]
-Description=Anygravity - Ultra-lightweight Antigravity Provider Pipe for Hermes Agent
+Description=Anygravity - Ultra-lightweight Antigravity Provider Pipe for Any AI Agent
 After=network.target
 
 [Service]
