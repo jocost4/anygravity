@@ -176,7 +176,7 @@ The repository includes a standalone MCP server exposing Antigravity subagents a
 mcp_servers:
   antigravity:
     command: python3
-    args: ["/home/YOUR_USER/hermesgravity/mcp/antigravity_mcp_server.py"]
+    args: ["/home/YOUR_USER/anygravity/mcp/antigravity_mcp_server.py"]
 ```
 
 ### Available MCP Tools:
@@ -215,7 +215,7 @@ Anygravity dynamically queries and supports the models available on your local `
 Run the unit test suite covering tool parsing, argument normalization, session key extraction, and streaming deduplication:
 
 ```bash
-cd /home/jojo_cost4/hermesgravity
+cd /home/jojo_cost4/anygravity
 go test -v ./...
 ```
 

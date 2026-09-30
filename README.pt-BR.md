@@ -174,7 +174,7 @@ O repositório inclui um servidor MCP nativo para expor as capacidades completas
 mcp_servers:
   antigravity:
     command: python3
-    args: ["/home/seu-usuario/hermesgravity/mcp/antigravity_mcp_server.py"]
+    args: ["/home/seu-usuario/anygravity/mcp/antigravity_mcp_server.py"]
 ```
 
 ### Ferramentas MCP Disponíveis:
@@ -213,7 +213,7 @@ O Anygravity consulta e suporta os modelos da sua instalação local do `agy`:
 Execute a suite de testes unitários que cobre parsing de ferramentas, normalização de argumentos, hash de sessão e deduplicação de streaming:
 
 ```bash
-cd /home/jojo_cost4/hermesgravity
+cd /home/jojo_cost4/anygravity
 go test -v ./...
 ```
 

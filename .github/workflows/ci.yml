@@ -30,7 +30,7 @@ jobs:
         run: go test -v -race ./...
 
       - name: Build static binary
-        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o hermesgravity main.go
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o anygravity main.go
 
       - name: Set up Python
         uses: actions/setup-python@v5
