@@ -97,9 +97,9 @@ Bridging a CLI assistant with an autonomous agent orchestrator presents unique a
 
 ```mermaid
 flowchart LR
-    A[Any AI Agent<br>(Hermes, Claude Code, Cursor, etc.)] -->|OpenAI SSE /v1/chat/completions| B(Anygravity Go Proxy :20130)
-    B -->|Concurrent Stdin Stream| C[Google Antigravity CLI]
-    C -->|Gemini 3.8 / Claude 4.6| D((Google / Anthropic AI))
+    A["Any AI Agent<br>(Hermes, Claude Code, Cursor, etc.)"] -->|OpenAI SSE /v1/chat/completions| B["Anygravity Go Proxy :20130"]
+    B -->|Concurrent Stdin Stream| C["Google Antigravity CLI"]
+    C -->|Gemini 3.8 / Claude 4.6| D(("Google / Anthropic AI"))
     C -.->|transcript.jsonl| B
     B -->|reasoning_content + tool_calls| A
 ```

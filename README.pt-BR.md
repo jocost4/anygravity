@@ -95,9 +95,9 @@ Criado para operar com estabilidade absoluta em ambientes com poucos recursos (c
 
 ```mermaid
 flowchart LR
-    A[Qualquer Agente de IA<br>(Hermes, Claude Code, Cursor, etc.)] -->|OpenAI SSE /v1/chat/completions| B(Anygravity Go Proxy :20130)
-    B -->|Concurrent Stdin Stream| C[Google Antigravity CLI]
-    C -->|Gemini 3.8 / Claude 4.6| D((Google / Anthropic AI))
+    A["Qualquer Agente de IA<br>(Hermes, Claude Code, Cursor, etc.)"] -->|OpenAI SSE /v1/chat/completions| B["Anygravity Go Proxy :20130"]
+    B -->|Concurrent Stdin Stream| C["Google Antigravity CLI"]
+    C -->|Gemini 3.8 / Claude 4.6| D(("Google / Anthropic AI"))
     C -.->|transcript.jsonl| B
     B -->|reasoning_content + tool_calls| A
 ```
