@@ -24,8 +24,8 @@
 ```
 
 <p align="center">
-  <b>Pipe Go de Alta Performance &amp; Ponte MCP para o Hermes Agent</b><br>
-  <i>Conecta o Google Antigravity (CLI <code>agy</code>) diretamente como Provider OpenAI SSE &amp; Servidor MCP</i>
+  <b>Pipe Go de Alta Performance &amp; Ponte MCP para Qualquer Agente de IA</b><br>
+  <i>Conecta o Google Antigravity (CLI <code>agy</code>) diretamente como Provider OpenAI SSE &amp; Servidor MCP para Hermes, Claude Code, Cursor, OpenCode, Codex e além</i>
 </p>
 
 <p align="center">
@@ -42,7 +42,7 @@
 
 ## 🚀 O que é o Anygravity?
 
-O **Anygravity** é um proxy/pipe de altíssima performance e nível de produção, escrito em **Go puro (sem dependências externas, sem CGO e com binário 100% estático)**, projetado para transformar o Google Antigravity (`agy` CLI) em um provedor de inferência OpenAI SSE e um servidor MCP para o **Hermes Agent**.
+O **Anygravity** é um proxy/pipe de altíssima performance e nível de produção, escrito em **Go puro (sem dependências externas, sem CGO e com binário 100% estático)**, projetado para transformar o Google Antigravity (`agy` CLI) em um provedor de inferência OpenAI SSE e um servidor MCP universal para **qualquer agente de IA** (Hermes Agent, Claude Code, Cursor, OpenCode, Codex, Aider, OpenDevin, OmniRoute, etc.).
 
 Criado para operar com estabilidade absoluta em ambientes com poucos recursos (como VPS de 1 vCPU e 1 GB de RAM), garantindo zero congelamentos, zero vazamento de memória e suporte a conversas multi-turn complexas com chamada de ferramentas.
 
@@ -67,7 +67,7 @@ Criado para operar com estabilidade absoluta em ambientes com poucos recursos (c
 
 5. **Tool Calling Bidirecional e Ciclo de Agentificação**:
    - Mapeia schemas de ferramentas do formato OpenAI (`tools`) para instruções interpretáveis pelo Antigravity.
-   - Protege a execução local via workspace hooks (`.agents/hooks.json`) que negam a execução local no `agy`, delegando 100% da execução das ferramentas de volta ao Hermes.
+   - Protege a execução local via workspace hooks (`.agents/hooks.json`) que negam a execução local no `agy`, delegando 100% da execução das ferramentas de volta ao agente chamador.
    - Inclui parser de chaves balanceadas (`extractJSONObject`) imune a quebras de regex em objetos e arrays JSON aninhados.
 
 6. **Persistência de Sessões Assíncrona e Debounced**:
@@ -95,7 +95,7 @@ Criado para operar com estabilidade absoluta em ambientes com poucos recursos (c
 
 ```mermaid
 flowchart LR
-    A[Hermes Agent / Desktop] -->|OpenAI SSE /v1/chat/completions| B(Anygravity Go Proxy :20130)
+    A[Qualquer Agente de IA<br>(Hermes, Claude Code, Cursor, etc.)] -->|OpenAI SSE /v1/chat/completions| B(Anygravity Go Proxy :20130)
     B -->|Concurrent Stdin Stream| C[Google Antigravity CLI]
     C -->|Gemini 3.8 / Claude 4.6| D((Google / Anthropic AI))
     C -.->|transcript.jsonl| B
@@ -235,4 +235,4 @@ go test -v ./...
 
 ## 🛡️ Licença
 
-Distribuído sob a licença MIT. Criado para a comunidade open-source unindo o ecossistema **Hermes Agent** e **Google Antigravity**.
+Distribuído sob a licença MIT. Criado para a comunidade open-source unindo o ecossistema do **Google Antigravity** com **qualquer agente de IA**.

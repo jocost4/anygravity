@@ -117,7 +117,7 @@ func initWorkspace() {
 
 	geminiMd := filepath.Join(workspaceDir, "GEMINI.md")
 	geminiContent := `# ANYGRAVITY COMPLETION ENGINE
-You are acting as the backend AI completion model for Hermes Agent.
+You are acting as the backend AI completion model for an external AI Agent.
 You MUST NOT execute any local system tools or commands directly.
 When a tool is needed, respond ONLY with:
 <tool_call>
@@ -428,8 +428,8 @@ func formatToolsPrompt(tools []ToolItem) string {
 [AVAILABLE TOOLS]
 %s
 
-[CRITICAL INSTRUCTIONS FOR HERMES AGENT]
-You are acting as the backend AI completion model for Hermes Agent.
+[CRITICAL INSTRUCTIONS FOR AI AGENT COMPLETION]
+You are acting as the backend AI completion model for an external AI Agent.
 - You DO NOT have permission to use or call any local system tools directly.
 - When a tool is needed, you MUST choose from [AVAILABLE TOOLS] and respond ONLY with the exact tag:
 <tool_call>
@@ -492,7 +492,7 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 
 	if toolsPrompt != "" {
 		sb.WriteString("[CRITICAL REMINDER]\n")
-		sb.WriteString("You are strictly the completion engine for Hermes Agent. Do NOT invoke local tools directly.\n")
+		sb.WriteString("You are strictly the completion engine for the AI Agent. Do NOT invoke local tools directly.\n")
 		sb.WriteString("When calling a tool from [AVAILABLE TOOLS], respond ONLY with:\n")
 		sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n\n")
 	}
@@ -554,7 +554,7 @@ func formatDeltaPrompt(messages []ChatMessage, startIndex int) string {
 	}
 
 	sb.WriteString("[CRITICAL REMINDER]\n")
-	sb.WriteString("You are strictly the completion engine for Hermes Agent. Do NOT invoke local tools directly.\n")
+	sb.WriteString("You are strictly the completion engine for the AI Agent. Do NOT invoke local tools directly.\n")
 	sb.WriteString("When calling a tool from [AVAILABLE TOOLS], respond ONLY with:\n")
 	sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n\n")
 	sb.WriteString("Assistant:")

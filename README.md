@@ -24,8 +24,8 @@
 ```
 
 <p align="center">
-  <b>High-Performance Production Go Pipe &amp; MCP Bridge for Hermes Agent</b><br>
-  <i>Connects Google Antigravity (<code>agy</code> CLI) as an OpenAI SSE Inference Provider &amp; MCP Server</i>
+  <b>High-Performance Production Go Pipe &amp; MCP Bridge for Any AI Agent</b><br>
+  <i>Connects Google Antigravity (<code>agy</code> CLI) as an OpenAI SSE Inference Provider &amp; MCP Server for Hermes, Claude Code, Cursor, OpenCode, Codex &amp; Beyond</i>
 </p>
 
 <p align="center">
@@ -42,7 +42,7 @@
 
 ## 🚀 Overview
 
-**Anygravity** is an ultra-lightweight, production-grade bridge written in **pure standard-library Go (zero external dependencies, zero CGO, 100% static binary)**. It connects Google Antigravity (`agy` CLI) directly to **Hermes Agent** as an OpenAI SSE inference provider and an MCP subagent server.
+**Anygravity** is an ultra-lightweight, production-grade bridge written in **pure standard-library Go (zero external dependencies, zero CGO, 100% static binary)**. It connects Google Antigravity (`agy` CLI) directly to **Any AI Agent** (Hermes Agent, Claude Code, Cursor, OpenCode, Codex, Aider, OpenDevin, OmniRoute) as an OpenAI SSE inference provider and an MCP subagent server.
 
 Designed specifically to run reliably in resource-constrained environments (such as cloud VPS instances with 1 vCPU and 1 GB RAM) without freezing, leaking memory, or crashing during long agentic multi-turn conversations.
 
@@ -69,7 +69,7 @@ Bridging a CLI assistant with an autonomous agent orchestrator presents unique a
 
 5. **Bidirectional Tool Calling & Agentic Loop**:
    - Translates OpenAI tool schemas into instructions Antigravity understands.
-   - Protects tool execution with workspace hooks (`.agents/hooks.json`) denying local execution by `agy`, delegating 100% of tool execution back to Hermes.
+   - Protects tool execution with workspace hooks (`.agents/hooks.json`) denying local execution by `agy`, delegating 100% of tool execution back to the agent.
    - Features a balanced-brace JSON parser (`extractJSONObject`) that cleanly handles deeply nested JSON objects and arrays without regex truncations.
 
 6. **Non-Blocking Debounced Session Persistence**:
@@ -89,7 +89,7 @@ Bridging a CLI assistant with an autonomous agent orchestrator presents unique a
 10. **Stateful Delta-Feeding & 1:1 Session Sync Engine**:
     - Solves the stateful-agent-meets-stateful-CLI paradox: instead of re-sending the accumulated message history to an existing Antigravity conversation (which causes exponential $O(N^2)$ token explosion), Anygravity extracts and transmits strictly the **turn delta** (~300 bytes vs ~380 KB).
     - Unlocks 100% KV Cache hits on Gemini/Claude backends, dropping multi-turn TTFT to sub-second speeds.
-    - Features self-healing desync guards that automatically handle history compaction, reprompts, and auxiliary task isolation (titling, guardrails, memory updates), strictly preserving **1 single conversation per Hermes session** in the Antigravity Brain.
+    - Features self-healing desync guards that automatically handle history compaction, reprompts, and auxiliary task isolation (titling, guardrails, memory updates), strictly preserving **1 single conversation per session** in the Antigravity Brain.
 
 ---
 
@@ -97,7 +97,7 @@ Bridging a CLI assistant with an autonomous agent orchestrator presents unique a
 
 ```mermaid
 flowchart LR
-    A[Hermes Agent / Desktop] -->|OpenAI SSE /v1/chat/completions| B(Anygravity Go Proxy :20130)
+    A[Any AI Agent<br>(Hermes, Claude Code, Cursor, etc.)] -->|OpenAI SSE /v1/chat/completions| B(Anygravity Go Proxy :20130)
     B -->|Concurrent Stdin Stream| C[Google Antigravity CLI]
     C -->|Gemini 3.8 / Claude 4.6| D((Google / Anthropic AI))
     C -.->|transcript.jsonl| B
@@ -237,4 +237,4 @@ go test -v ./...
 
 ## 🛡️ License
 
-Released under the **MIT License**. Built to unite the **Hermes Agent** and **Google Antigravity** communities.
+Released under the **MIT License**. Built to unite **Google Antigravity** with **Any AI Agent**.
