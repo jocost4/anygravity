@@ -80,7 +80,10 @@ func TestExtractSessionKey(t *testing.T) {
 	hdr := http.Header{}
 	hdr.Set("X-Hermes-Session-Id", "sess_12345")
 
-	key := extractSessionKey([]ChatMessage{}, hdr)
+	key, isAux := extractSessionKey([]ChatMessage{}, nil, hdr)
+	if isAux {
+		t.Errorf("expected isAux=false, got true")
+	}
 	if key != "hdr_sess_12345" {
 		t.Errorf("expected hdr_sess_12345, got %s", key)
 	}
@@ -91,9 +94,21 @@ func TestExtractSessionKey(t *testing.T) {
 		{Role: "system", Content: json.RawMessage(`"You are a helpful assistant."`)},
 		{Role: "user", Content: json.RawMessage(`"Hello world!"`)},
 	}
-	key2 := extractSessionKey(msgs, emptyHdr)
-	if len(key2) != 16 {
-		t.Errorf("expected 16-hex-char hash, got %s (len=%d)", key2, len(key2))
+	key2, isAux2 := extractSessionKey(msgs, nil, emptyHdr)
+	if isAux2 {
+		t.Errorf("expected isAux2=false, got true")
+	}
+	if len(key2) != 24 {
+		t.Errorf("expected 24-hex-char hash, got %s (len=%d)", key2, len(key2))
+	}
+
+	// Test auxiliary request detection
+	auxMsgs := []ChatMessage{
+		{Role: "system", Content: json.RawMessage(`"You name chat sessions. Given the user's opening message..."`)},
+	}
+	_, isAux3 := extractSessionKey(auxMsgs, nil, emptyHdr)
+	if !isAux3 {
+		t.Errorf("expected isAux3=true for titling request, got false")
 	}
 }
 

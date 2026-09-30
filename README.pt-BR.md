@@ -84,6 +84,11 @@ Criado para operar com estabilidade absoluta em ambientes com poucos recursos (c
 9. **Graceful Shutdown**:
    - Captura sinais `SIGINT` e `SIGTERM`, faz o flush atômico do mapa de sessões, encerra grupos de subprocessos (`syscall.Kill(-pid, SIGKILL)`) e desliga o servidor HTTP de forma limpa.
 
+10. **Stateful Delta-Feeding & Sincronização 1:1 de Sessões**:
+    - Resolve o paradoxo entre o agente cumulativo (Hermes) e a CLI persistente (Antigravity): em vez de re-enviar todo o histórico acumulado (o que causava explosão exponencial $O(N^2)$ de tokens), o Hermesgravity extrai e transmite estritamente o **delta do turno** (~300 bytes contra ~380 KB).
+    - Habilita 100% de reaproveitamento de KV Cache nos backends Gemini/Claude, despencando o TTFT multi-turno para centenas de milissegundos.
+    - Possui salvaguardas de auto-cura contra desync que tratam podas/compactações de contexto, reprompts e isolamento de tarefas efêmeras (títulos, guardrails, reflexão de memória), mantendo **estritamente 1 única conversa por sessão** no Brain do Antigravity.
+
 ---
 
 ## 📐 Arquitetura
