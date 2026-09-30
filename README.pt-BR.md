@@ -15,12 +15,12 @@
                                  =)][[]<>*+*+++**>*><+*=-:::::               
                                     ::-===++===-::                           
 
-██╗  ██╗███████╗██████╗ ███╗   ███╗███████╗███████╗ ██████╗ ██████╗  █████╗ ██╗   ██╗██╗████████╗██╗   ██╗
-██║  ██║██╔════╝██╔══██╗████╗ ████║██╔════╝██╔════╝██╔════╝ ██╔══██╗██╔══██╗██║   ██║██║╚══██╔══╝╚██╗ ██╔╝
-███████║█████╗  ██████╔╝██╔████╔██║█████╗  ███████╗██║  ███╗██████╔╝███████║██║   ██║██║   ██║    ╚████╔╝ 
-██╔══██║██╔══╝  ██╔══██╗██║╚██╔╝██║██╔══╝  ╚════██║██║   ██║██╔══██╗██╔══██║╚██╗ ██╔╝██║   ██║     ╚██╔╝  
-██║  ██║███████╗██║  ██║██║ ╚═╝ ██║███████╗███████║╚██████╔╝██║  ██║██║  ██║ ╚████╔╝ ██║   ██║      ██║   
-╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝   ╚═╝      ╚═╝ 
+  █████╗ ███╗   ██╗██╗   ██╗ ██████╗ ██████╗   █████╗ ██╗   ██╗██╗████████╗██╗   ██╗
+██╔══██╗████╗  ██║╚██╗ ██╔╝██╔════╝ ██╔══██╗██╔══██╗██║   ██║██║╚══██╔══╝╚██╗ ██╔╝
+███████║██╔██╗ ██║ ╚████╔╝ ██║  ███╗██████╔╝███████║██║   ██║██║   ██║    ╚████╔╝ 
+██╔══██║██║╚██╗██║  ╚██╔╝  ██║   ██║██╔══██╗██╔══██║╚██╗ ██╔╝██║   ██║     ╚██╔╝  
+██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║  ██║██║  ██║ ╚████╔╝ ██║   ██║      ██║   
+╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝   ╚═╝      ╚═╝   
 ```
 
 <p align="center">
@@ -35,14 +35,14 @@
   <a href="#-problemas-críticos-resolvidos"><img src="https://img.shields.io/badge/STDIN-Streaming-orange?style=for-the-badge" alt="STDIN Streaming"></a>
   <a href="#-suite-de-testes"><img src="https://img.shields.io/badge/Testes-100%25%20Aprovados-brightgreen?style=for-the-badge" alt="Testes"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge" alt="License"></a>
-  <a href="https://github.com/jocost4/hermesgravity/stargazers"><img src="https://img.shields.io/github/stars/jocost4/hermesgravity?style=for-the-badge" alt="Stars"></a>
+  <a href="https://github.com/jocost4/anygravity/stargazers"><img src="https://img.shields.io/github/stars/jocost4/anygravity?style=for-the-badge" alt="Stars"></a>
 </p>
 
 ---
 
-## 🚀 O que é o Hermesgravity?
+## 🚀 O que é o Anygravity?
 
-O **Hermesgravity** é um proxy/pipe de altíssima performance e nível de produção, escrito em **Go puro (sem dependências externas, sem CGO e com binário 100% estático)**, projetado para transformar o Google Antigravity (`agy` CLI) em um provedor de inferência OpenAI SSE e um servidor MCP para o **Hermes Agent**.
+O **Anygravity** é um proxy/pipe de altíssima performance e nível de produção, escrito em **Go puro (sem dependências externas, sem CGO e com binário 100% estático)**, projetado para transformar o Google Antigravity (`agy` CLI) em um provedor de inferência OpenAI SSE e um servidor MCP para o **Hermes Agent**.
 
 Criado para operar com estabilidade absoluta em ambientes com poucos recursos (como VPS de 1 vCPU e 1 GB de RAM), garantindo zero congelamentos, zero vazamento de memória e suporte a conversas multi-turn complexas com chamada de ferramentas.
 
@@ -52,7 +52,7 @@ Criado para operar com estabilidade absoluta em ambientes com poucos recursos (c
 
 1. **Bypass de `ARG_MAX` (`E2BIG - argument list too long`)**:
    - Proxies comuns disparam o executável com `-p "<prompt>"`. Após algumas rodadas de conversa com retornos de ferramentas (`Ran [...] + 18 commands`), o tamanho dos argumentos excede o limite do kernel Linux (`ARG_MAX`), travando a execução.
-   - O **Hermesgravity** transmite todo o histórico e instruções via **STDIN Pipe assíncrono**, suportando prompts gigantescos (testado com mais de 300.000 caracteres) sem limite de tamanho.
+   - O **Anygravity** transmite todo o histórico e instruções via **STDIN Pipe assíncrono**, suportando prompts gigantescos (testado com mais de 300.000 caracteres) sem limite de tamanho.
 
 2. **Pegada de Memória Ridiculamente Baixa (~2.9 MB RSS)**:
    - Substitui implementações pesadas em Python (FastAPI/Uvicorn ~72 MB) por um binário nativo Go estático.
@@ -85,7 +85,7 @@ Criado para operar com estabilidade absoluta em ambientes com poucos recursos (c
    - Captura sinais `SIGINT` e `SIGTERM`, faz o flush atômico do mapa de sessões, encerra grupos de subprocessos (`syscall.Kill(-pid, SIGKILL)`) e desliga o servidor HTTP de forma limpa.
 
 10. **Stateful Delta-Feeding & Sincronização 1:1 de Sessões**:
-    - Resolve o paradoxo entre o agente cumulativo (Hermes) e a CLI persistente (Antigravity): em vez de re-enviar todo o histórico acumulado (o que causava explosão exponencial $O(N^2)$ de tokens), o Hermesgravity extrai e transmite estritamente o **delta do turno** (~300 bytes contra ~380 KB).
+    - Resolve o paradoxo entre o agente cumulativo (Hermes) e a CLI persistente (Antigravity): em vez de re-enviar todo o histórico acumulado (o que causava explosão exponencial $O(N^2)$ de tokens), o Anygravity extrai e transmite estritamente o **delta do turno** (~300 bytes contra ~380 KB).
     - Habilita 100% de reaproveitamento de KV Cache nos backends Gemini/Claude, despencando o TTFT multi-turno para centenas de milissegundos.
     - Possui salvaguardas de auto-cura contra desync que tratam podas/compactações de contexto, reprompts e isolamento de tarefas efêmeras (títulos, guardrails, reflexão de memória), mantendo **estritamente 1 única conversa por sessão** no Brain do Antigravity.
 
@@ -95,7 +95,7 @@ Criado para operar com estabilidade absoluta em ambientes com poucos recursos (c
 
 ```mermaid
 flowchart LR
-    A[Hermes Agent / Desktop] -->|OpenAI SSE /v1/chat/completions| B(Hermesgravity Go Proxy :20130)
+    A[Hermes Agent / Desktop] -->|OpenAI SSE /v1/chat/completions| B(Anygravity Go Proxy :20130)
     B -->|Concurrent Stdin Stream| C[Google Antigravity CLI]
     C -->|Gemini 3.8 / Claude 4.6| D((Google / Anthropic AI))
     C -.->|transcript.jsonl| B
@@ -108,7 +108,7 @@ flowchart LR
 
 Testado em VPS Ubuntu 24.04 (1 vCPU, 1 GB RAM):
 
-| Métrica | Proxy Legado (Python / FastAPI) | **Hermesgravity (Go Nativo)** | Diferença |
+| Métrica | Proxy Legado (Python / FastAPI) | **Anygravity (Go Nativo)** | Diferença |
 | :--- | :--- | :--- | :--- |
 | **Uso de Memória RSS** | ~72.4 MB | **~2.9 MB** | **-96% de RAM** |
 | **Tempo de Inicialização** | ~1.42s | **< 15ms** | **94x mais rápido** |
@@ -122,23 +122,23 @@ Testado em VPS Ubuntu 24.04 (1 vCPU, 1 GB RAM):
 
 ### 1. Clonar e Compilar
 ```bash
-git clone https://github.com/jocost4/hermesgravity.git
-cd hermesgravity
+git clone https://github.com/jocost4/anygravity.git
+cd anygravity
 sudo ./install.sh
 ```
 
-O instalador compila o binário estático, instala em `/usr/local/bin/hermesgravity`, cria o serviço systemd configurado para o seu usuário local com limite de 64MB de RAM e inicia o daemon.
+O instalador compila o binário estático, instala em `/usr/local/bin/anygravity` (mantendo `/usr/local/bin/hermesgravity` como symlink para compatibilidade), cria o serviço systemd configurado para o seu usuário local com limite de 64MB de RAM e inicia o daemon.
 
 ### 2. Comandos do Serviço Systemd
 ```bash
 # Ver status em tempo real
-sudo systemctl status hermesgravity
+sudo systemctl status anygravity
 
 # Acompanhar logs
-sudo journalctl -u hermesgravity -f
+sudo journalctl -u anygravity -f
 
 # Reiniciar serviço
-sudo systemctl restart hermesgravity
+sudo systemctl restart anygravity
 ```
 
 ---
@@ -189,7 +189,7 @@ mcp_servers:
 
 ## 🎯 Modelos Suportados
 
-O Hermesgravity consulta e suporta os modelos da sua instalação local do `agy`:
+O Anygravity consulta e suporta os modelos da sua instalação local do `agy`:
 
 | Model ID | Nome | Descrição |
 | :--- | :--- | :--- |

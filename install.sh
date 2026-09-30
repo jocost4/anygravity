@@ -2,12 +2,13 @@
 set -euo pipefail
 
 echo "=========================================================="
-echo "  Hermesgravity - Antigravity to Hermes Agent Pipe Setup"
+echo "  Anygravity - Antigravity to Hermes Agent Pipe Setup"
 echo "=========================================================="
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN_PATH="/usr/local/bin/hermesgravity"
-SERVICE_PATH="/etc/systemd/system/hermesgravity.service"
+BIN_PATH="/usr/local/bin/anygravity"
+LEGACY_BIN_PATH="/usr/local/bin/hermesgravity"
+SERVICE_PATH="/etc/systemd/system/anygravity.service"
 PORT="${PORT:-20130}"
 HOST="${HOST:-127.0.0.1}"
 
@@ -28,16 +29,21 @@ if ! command -v go >/dev/null 2>&1; then
     fi
 fi
 
-echo "[+] Building hermesgravity static binary..."
+echo "[+] Building anygravity static binary..."
 cd "$REPO_DIR"
-CGO_ENABLED=0 "$GO_CMD" build -ldflags="-s -w" -o hermesgravity main.go
+CGO_ENABLED=0 "$GO_CMD" build -ldflags="-s -w" -o anygravity main.go
+ln -sf anygravity hermesgravity
 
 echo "[+] Installing binary to $BIN_PATH..."
+if systemctl is-active --quiet anygravity 2>/dev/null; then
+    sudo systemctl stop anygravity
+fi
 if systemctl is-active --quiet hermesgravity 2>/dev/null; then
     sudo systemctl stop hermesgravity
 fi
-sudo cp -f hermesgravity "$BIN_PATH"
+sudo cp -f anygravity "$BIN_PATH"
 sudo chmod +x "$BIN_PATH"
+sudo ln -sf "$BIN_PATH" "$LEGACY_BIN_PATH"
 
 echo "[+] Detecting install user and home directory..."
 INSTALL_USER="${SUDO_USER:-$(id -un)}"
@@ -55,18 +61,18 @@ sed -e "s|^User=.*|User=${INSTALL_USER}|g" \
     -e "s|^Environment=PORT=.*|Environment=PORT=${PORT}|g" \
     -e "s|^WorkingDirectory=.*|WorkingDirectory=${INSTALL_HOME}|g" \
     -e "s|/home/ubuntu|${INSTALL_HOME}|g" \
-    "$REPO_DIR/systemd/hermesgravity.service" | sudo tee "$SERVICE_PATH" > /dev/null
+    "$REPO_DIR/systemd/anygravity.service" | sudo tee "$SERVICE_PATH" > /dev/null
 
 sudo systemctl daemon-reload
-sudo systemctl enable hermesgravity
-sudo systemctl restart hermesgravity
+sudo systemctl enable anygravity
+sudo systemctl restart anygravity
 
 echo "[+] Verifying health on http://${HOST}:${PORT}/health..."
 sleep 1
 if curl -sf "http://${HOST}:${PORT}/health" >/dev/null 2>&1; then
-    echo "[✓] Hermesgravity is running on http://${HOST}:${PORT}!"
+    echo "[✓] Anygravity is running on http://${HOST}:${PORT}!"
 else
-    echo "[!] Warning: Server did not respond immediately. Check: journalctl -u hermesgravity -f"
+    echo "[!] Warning: Server did not respond immediately. Check: journalctl -u anygravity -f"
 fi
 
 echo ""

@@ -155,10 +155,15 @@ func TestResolveModel(t *testing.T) {
 }
 
 func TestAuthMiddleware(t *testing.T) {
-	origKey := os.Getenv("HERMESGRAVITY_API_KEY")
-	defer os.Setenv("HERMESGRAVITY_API_KEY", origKey)
+	origAnyKey := os.Getenv("ANYGRAVITY_API_KEY")
+	origHermesKey := os.Getenv("HERMESGRAVITY_API_KEY")
+	defer func() {
+		os.Setenv("ANYGRAVITY_API_KEY", origAnyKey)
+		os.Setenv("HERMESGRAVITY_API_KEY", origHermesKey)
+	}()
 
-	os.Setenv("HERMESGRAVITY_API_KEY", "secret-test-key")
+	os.Setenv("ANYGRAVITY_API_KEY", "secret-test-key")
+	os.Unsetenv("HERMESGRAVITY_API_KEY")
 
 	handler := authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

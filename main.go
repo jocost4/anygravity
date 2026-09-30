@@ -32,7 +32,7 @@ import (
 const (
 	DefaultHost    = "127.0.0.1"
 	DefaultPort    = "20130"
-	Version        = "3.3-go"
+	Version        = "4.0-anygravity"
 	DefaultTimeout = 180 * time.Second
 	StreamTimeout  = 600 * time.Second
 )
@@ -52,6 +52,9 @@ func getPort() string {
 }
 
 func getAPIKey() string {
+	if k := os.Getenv("ANYGRAVITY_API_KEY"); k != "" {
+		return k
+	}
 	if k := os.Getenv("HERMESGRAVITY_API_KEY"); k != "" {
 		return k
 	}
@@ -60,7 +63,7 @@ func getAPIKey() string {
 
 var (
 	agyBin       = filepath.Join(os.Getenv("HOME"), ".local/bin/agy")
-	workspaceDir = filepath.Join(os.Getenv("HOME"), ".hermes/hermesgravity_workspace")
+	workspaceDir = filepath.Join(os.Getenv("HOME"), ".hermes/anygravity_workspace")
 
 	fallbackModels = []ModelItem{
 		{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High)"},
@@ -113,7 +116,7 @@ func initWorkspace() {
 	_ = os.MkdirAll(agentsDir, 0755)
 
 	geminiMd := filepath.Join(workspaceDir, "GEMINI.md")
-	geminiContent := `# HERMESGRAVITY COMPLETION ENGINE
+	geminiContent := `# ANYGRAVITY COMPLETION ENGINE
 You are acting as the backend AI completion model for Hermes Agent.
 You MUST NOT execute any local system tools or commands directly.
 When a tool is needed, respond ONLY with:
@@ -131,7 +134,7 @@ When a tool is needed, respond ONLY with:
         "matcher": "*",
         "hooks": [
           {
-            "command": "echo '{\"decision\": \"deny\", \"reason\": \"Local tool execution is disabled by Hermesgravity. Output tool calls as text <tool_call>...\"}'"
+            "command": "echo '{\"decision\": \"deny\", \"reason\": \"Local tool execution is disabled by Anygravity. Output tool calls as text <tool_call>...\"}'"
           }
         ]
       }
@@ -2047,7 +2050,7 @@ func main() {
 	addr := net.JoinHostPort(host, port)
 
 	if (host == "0.0.0.0" || host == "") && getAPIKey() == "" {
-		log.Printf("[SECURITY WARNING] Server is binding to all interfaces (%s) without HERMESGRAVITY_API_KEY! Set HERMESGRAVITY_API_KEY to protect your machine.", addr)
+		log.Printf("[SECURITY WARNING] Server is binding to all interfaces (%s) without ANYGRAVITY_API_KEY! Set ANYGRAVITY_API_KEY to protect your machine.", addr)
 	}
 
 	server := &http.Server{
@@ -2063,7 +2066,7 @@ func main() {
 
 	go func() {
 		<-stop
-		log.Println("[Hermesgravity] Shutting down gracefully...")
+		log.Println("[Anygravity] Shutting down gracefully...")
 		sessionCancel()
 		globalSessions.flush()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2071,7 +2074,7 @@ func main() {
 		_ = server.Shutdown(ctx)
 	}()
 
-	log.Printf("[Hermesgravity] Service listening on http://%s (RSS: ~2.9MB)", addr)
+	log.Printf("[Anygravity] Service listening on http://%s (RSS: ~2.9MB)", addr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server error: %v", err)
 	}

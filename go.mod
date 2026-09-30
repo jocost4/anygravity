@@ -1,3 +1,3 @@
-module github.com/jocost4/hermesgravity
+module github.com/jocost4/anygravity
 
 go 1.22
