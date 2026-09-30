@@ -143,22 +143,198 @@ When a tool is needed, respond ONLY with:
 }
 
 // -----------------------------------------------------------------------------
-// Request Metadata & Session Key Extractor
+// Session Tracking & Delta State Engine
 // -----------------------------------------------------------------------------
 
-func extractSessionKey(messages []ChatMessage, headers http.Header) string {
-	for _, h := range []string{"X-Session-Id", "X-Conversation-Id", "X-Hermes-Session-Id"} {
-		if val := headers.Get(h); val != "" {
-			return "hdr_" + strings.TrimSpace(val)
+type SessionState struct {
+	ConvID        string    `json:"conv_id"`
+	Model         string    `json:"model"`
+	CreatedAt     time.Time `json:"created_at"`
+	LastSeen      time.Time `json:"last_seen"`
+	MessageCount  int       `json:"message_count"`
+	HistoryHashes []string  `json:"history_hashes"`
+	ToolsHash     string    `json:"tools_hash"`
+	TotalTurns    int       `json:"total_turns"`
+}
+
+type SessionManager struct {
+	mu       sync.RWMutex
+	sessions map[string]*SessionState
+	filePath string
+	trigger  chan struct{}
+}
+
+var globalSessions = &SessionManager{
+	sessions: make(map[string]*SessionState),
+	filePath: filepath.Join(os.Getenv("HOME"), ".hermes/antigravity_session_map.json"),
+	trigger:  make(chan struct{}, 1),
+}
+
+func initSessionManager(ctx context.Context) {
+	globalSessions.load()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-globalSessions.trigger:
+				globalSessions.flush()
+			case <-ticker.C:
+				globalSessions.cleanupExpired()
+			case <-ctx.Done():
+				globalSessions.flush()
+				return
+			}
+		}
+	}()
+}
+
+func (sm *SessionManager) load() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	data, err := os.ReadFile(sm.filePath)
+	if err == nil {
+		_ = json.Unmarshal(data, &sm.sessions)
+	}
+}
+
+func (sm *SessionManager) flush() {
+	sm.mu.RLock()
+	data, err := json.MarshalIndent(sm.sessions, "", "  ")
+	sm.mu.RUnlock()
+	if err == nil {
+		_ = os.WriteFile(sm.filePath, data, 0644)
+	}
+}
+
+func (sm *SessionManager) notifySave() {
+	select {
+	case sm.trigger <- struct{}{}:
+	default:
+	}
+}
+
+func (sm *SessionManager) cleanupExpired() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	now := time.Now()
+	changed := false
+	for k, s := range sm.sessions {
+		if now.Sub(s.LastSeen) > 4*time.Hour {
+			delete(sm.sessions, k)
+			changed = true
 		}
 	}
+	if changed {
+		sm.notifySave()
+	}
+}
+
+func (sm *SessionManager) Get(key string) *SessionState {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if s, ok := sm.sessions[key]; ok {
+		cp := *s
+		cp.HistoryHashes = append([]string(nil), s.HistoryHashes...)
+		return &cp
+	}
+	return nil
+}
+
+func (sm *SessionManager) Update(key string, state *SessionState) {
+	sm.mu.Lock()
+	state.LastSeen = time.Now()
+	oldState := sm.sessions[key]
+	sm.sessions[key] = state
+	if len(sm.sessions) > 500 {
+		for k := range sm.sessions {
+			delete(sm.sessions, k)
+			if len(sm.sessions) <= 400 {
+				break
+			}
+		}
+	}
+	sm.mu.Unlock()
+	sm.notifySave()
+
+	if oldState != nil && oldState.ConvID != "" && oldState.ConvID != state.ConvID {
+		log.Printf("[Proxy-Cleanup] Session %s migrated from conv %s to %s. Removing old conv folder.", key, oldState.ConvID, state.ConvID)
+		go func(oldCID string) {
+			time.Sleep(3 * time.Second)
+			for _, bDir := range brainDirs {
+				p := filepath.Join(bDir, oldCID)
+				if _, err := os.Stat(p); err == nil {
+					_ = os.RemoveAll(p)
+				}
+			}
+		}(oldState.ConvID)
+	}
+}
+
+func (sm *SessionManager) Invalidate(key string) {
+	sm.mu.Lock()
+	delete(sm.sessions, key)
+	sm.mu.Unlock()
+	sm.notifySave()
+}
+
+func hashMessage(m ChatMessage) string {
+	h := sha256.New()
+	h.Write([]byte(m.Role))
+	h.Write([]byte(m.Name))
+	h.Write([]byte(m.ToolCallID))
+	h.Write(m.Content)
+	h.Write(m.ToolCalls)
+	return hex.EncodeToString(h.Sum(nil)[:8])
+}
+
+func hashTools(tools []ToolItem) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(tools)
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:8])
+}
+
+func isAuxiliaryRequest(messages []ChatMessage, tools []ToolItem) bool {
+	if len(tools) == 0 {
+		for _, m := range messages {
+			c := strings.ToLower(m.ContentString())
+			if strings.Contains(c, "you name chat sessions") ||
+				strings.Contains(c, "conversation summarizer") ||
+				strings.Contains(c, "extract facts") ||
+				strings.Contains(c, "generate a title") ||
+				strings.Contains(c, "the following command was flagged as:") ||
+				strings.Contains(c, "command execution confirmation") ||
+				strings.Contains(c, "review the conversation above and update") ||
+				strings.Contains(c, "update two things:\n\n**memory**") ||
+				strings.Contains(c, "memory extraction") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func extractSessionKey(messages []ChatMessage, tools []ToolItem, headers http.Header) (key string, isAux bool) {
+	if isAuxiliaryRequest(messages, tools) {
+		return "", true
+	}
+
+	for _, h := range []string{"X-Session-Id", "X-Hermes-Session-Id", "X-Conversation-Id"} {
+		if val := headers.Get(h); val != "" {
+			return "hdr_" + strings.TrimSpace(val), false
+		}
+	}
+
 	systemText := ""
 	firstUser := ""
 	for _, m := range messages {
 		if m.Role == "system" && systemText == "" {
 			systemText = m.ContentString()
-			if len(systemText) > 150 {
-				systemText = systemText[:150]
+			if len(systemText) > 250 {
+				systemText = systemText[:250]
 			}
 		} else if m.Role == "user" && firstUser == "" {
 			firstUser = m.ContentString()
@@ -170,8 +346,12 @@ func extractSessionKey(messages []ChatMessage, headers http.Header) string {
 			break
 		}
 	}
-	h := sha256.Sum256([]byte(systemText + "|" + firstUser))
-	return hex.EncodeToString(h[:8])
+
+	h := sha256.New()
+	h.Write([]byte(systemText))
+	h.Write([]byte("|"))
+	h.Write([]byte(firstUser))
+	return hex.EncodeToString(h.Sum(nil)[:12]), false
 }
 
 // -----------------------------------------------------------------------------
@@ -315,6 +495,67 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 	}
 
 	sb.WriteString("Assistant:")
+	return sb.String()
+}
+
+func formatDeltaPrompt(messages []ChatMessage, startIndex int) string {
+	var sb strings.Builder
+
+	for i := startIndex; i < len(messages); i++ {
+		msg := messages[i]
+		c := msg.ContentString()
+
+		// If the first message in the delta is the assistant message from the immediately
+		// preceding turn, AGY already has it recorded in its transcript as PLANNER_RESPONSE.
+		// Skip it to avoid duplicate assistant monologue/tool tags!
+		if i == startIndex && msg.Role == "assistant" {
+			continue
+		}
+
+		switch msg.Role {
+		case "tool":
+			toolName := msg.Name
+			if toolName == "" {
+				toolName = "tool"
+			}
+			if len(c) > 4000 {
+				c = c[:2000] + "\n\n[... content truncated for brevity ...]\n\n" + c[len(c)-1000:]
+			}
+			sb.WriteString(fmt.Sprintf("[Tool Result for '%s']:\n%s\n\n", toolName, c))
+
+		case "user":
+			sb.WriteString("User: " + c + "\n\n")
+
+		case "assistant":
+			if len(msg.ToolCalls) > 0 && string(msg.ToolCalls) != "null" {
+				var tcList []struct {
+					Function struct {
+						Name      string          `json:"name"`
+						Arguments json.RawMessage `json:"arguments"`
+					} `json:"function"`
+				}
+				_ = json.Unmarshal(msg.ToolCalls, &tcList)
+				for _, tc := range tcList {
+					argStr := string(tc.Function.Arguments)
+					if strings.HasPrefix(argStr, "\"") {
+						var unq string
+						_ = json.Unmarshal(tc.Function.Arguments, &unq)
+						argStr = unq
+					}
+					sb.WriteString(fmt.Sprintf("<tool_call>\n{\"name\": \"%s\", \"arguments\": %s}\n</tool_call>\n\n", tc.Function.Name, argStr))
+				}
+			} else if c != "" {
+				sb.WriteString("Assistant: " + c + "\n\n")
+			}
+		}
+	}
+
+	sb.WriteString("[CRITICAL REMINDER]\n")
+	sb.WriteString("You are strictly the completion engine for Hermes Agent. Do NOT invoke local tools directly.\n")
+	sb.WriteString("When calling a tool from [AVAILABLE TOOLS], respond ONLY with:\n")
+	sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n\n")
+	sb.WriteString("Assistant:")
+
 	return sb.String()
 }
 
@@ -828,15 +1069,74 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessionKey := extractSessionKey(req.Messages, r.Header)
-	// Only use an existing AGY conversation if explicitly requested by header.
-	// Hermes Agent is already stateful and sends the complete conversation history
-	// in req.Messages on every turn. Reusing AGY internal conversations causes
-	// duplicate history accumulation (800k+ tokens) leading to subscriber stall timeouts.
+	sessionKey, isAux := extractSessionKey(req.Messages, req.Tools, r.Header)
 	convID := r.Header.Get("X-Conversation-Id")
 
+	// Calculate message hashes for prefix integrity verification
+	currentHashes := make([]string, len(req.Messages))
+	for i, m := range req.Messages {
+		currentHashes[i] = hashMessage(m)
+	}
+	toolsHash := hashTools(req.Tools)
+
+	var activeState *SessionState
+	if !isAux && sessionKey != "" && convID == "" {
+		activeState = globalSessions.Get(sessionKey)
+	}
+
+	var finalPrompt string
+	var fallbackFullPrompt string
+	isDelta := false
+
 	toolsPrompt := formatToolsPrompt(req.Tools)
-	finalPrompt := formatConversation(req.Messages, toolsPrompt)
+	fallbackFullPrompt = formatConversation(req.Messages, toolsPrompt)
+
+	if activeState != nil && activeState.ConvID != "" && activeState.Model == model && activeState.ToolsHash == toolsHash {
+		if len(req.Messages) > activeState.MessageCount {
+			prefixOK := true
+			for i := 0; i < activeState.MessageCount; i++ {
+				if currentHashes[i] != activeState.HistoryHashes[i] {
+					prefixOK = false
+					break
+				}
+			}
+
+			if prefixOK {
+				finalPrompt = formatDeltaPrompt(req.Messages, activeState.MessageCount)
+				convID = activeState.ConvID
+				isDelta = true
+				log.Printf("[Proxy-Delta] Session %s continuing conv %s: delta (%d chars) for msgs %d..%d",
+					sessionKey, convID, len(finalPrompt), activeState.MessageCount, len(req.Messages))
+			} else {
+				log.Printf("[Proxy-Delta] Desync detected for session %s (prefix changed). Re-anchoring.", sessionKey)
+				globalSessions.Invalidate(sessionKey)
+			}
+		} else if len(req.Messages) == activeState.MessageCount && activeState.MessageCount > 0 {
+			prefixOK := true
+			for i := 0; i < activeState.MessageCount-1; i++ {
+				if currentHashes[i] != activeState.HistoryHashes[i] {
+					prefixOK = false
+					break
+				}
+			}
+			if prefixOK {
+				finalPrompt = formatDeltaPrompt(req.Messages, activeState.MessageCount-1)
+				convID = activeState.ConvID
+				isDelta = true
+				log.Printf("[Proxy-Delta] Session %s reprompt on same conv %s: delta (%d chars) for msg %d",
+					sessionKey, convID, len(finalPrompt), activeState.MessageCount-1)
+			}
+		} else if len(req.Messages) < activeState.MessageCount {
+			log.Printf("[Proxy-Delta] History truncation/compaction detected for session %s. Re-anchoring.", sessionKey)
+			globalSessions.Invalidate(sessionKey)
+		}
+	}
+
+	if !isDelta {
+		finalPrompt = fallbackFullPrompt
+		log.Printf("[Proxy-Full] Starting anchor prompt for session %s (aux=%v, msgs=%d, chars=%d)",
+			sessionKey, isAux, len(req.Messages), len(finalPrompt))
+	}
 
 	lastMsgSummary := ""
 	if len(req.Messages) > 0 {
@@ -848,8 +1148,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		lastMsgSummary = fmt.Sprintf("role=%s len=%d content=%q", lastMsg.Role, len(contentStr), contentStr[:limit])
 	}
-	log.Printf("[Proxy] Request #%d: model=%s (orig: %s) stream=%v msgs=%d tools=%d promptLen=%d last=[%s]",
-		reqCount.Load(), model, req.Model, req.Stream, len(req.Messages), len(req.Tools), len(finalPrompt), lastMsgSummary)
+	log.Printf("[Proxy] Request #%d: model=%s (orig: %s) delta=%v stream=%v msgs=%d tools=%d promptLen=%d last=[%s]",
+		reqCount.Load(), model, req.Model, isDelta, req.Stream, len(req.Messages), len(req.Tools), len(finalPrompt), lastMsgSummary)
 
 	createdTs := time.Now().Unix()
 	completionID := fmt.Sprintf("chatcmpl-agy-%d", createdTs)
@@ -882,9 +1182,9 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		handleStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, convID, finalPrompt, len(req.Tools) > 0)
+		handleStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, isAux, isDelta, convID, finalPrompt, fallbackFullPrompt, currentHashes, toolsHash, len(req.Tools) > 0)
 	} else {
-		handleNonStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, convID, finalPrompt)
+		handleNonStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, isAux, isDelta, convID, finalPrompt, fallbackFullPrompt, currentHashes, toolsHash)
 	}
 }
 
@@ -897,7 +1197,11 @@ func handleStreamingCompletion(
 	args []string,
 	completionID, model string,
 	createdTs int64,
-	sessionKey, initialConvID, finalPrompt string,
+	sessionKey string,
+	isAux, isDelta bool,
+	initialConvID, finalPrompt, fallbackFullPrompt string,
+	currentHashes []string,
+	toolsHash string,
 	hasTools bool,
 ) {
 	flusher, ok := w.(http.Flusher)
@@ -1022,6 +1326,28 @@ func handleStreamingCompletion(
 			streamPending.Reset()
 			isBufferingTool = false
 			time.Sleep(500 * time.Millisecond)
+
+			if isDelta {
+				if ctx.Err() != nil || r.Context().Err() != nil {
+					log.Printf("[Proxy-Delta] Client disconnected/canceled for convID %s. Preserving session.", initialConvID)
+					return
+				}
+				log.Printf("[Proxy-Delta] Attempt 1 failed on convID %s. Falling back to fresh anchor.", initialConvID)
+				if sessionKey != "" {
+					globalSessions.Invalidate(sessionKey)
+				}
+				var filteredArgs []string
+				for idx := 0; idx < len(args); idx++ {
+					if args[idx] == "--conversation" {
+						idx++
+						continue
+					}
+					filteredArgs = append(filteredArgs, args[idx])
+				}
+				args = filteredArgs
+				finalPrompt = fallbackFullPrompt
+				isDelta = false
+			}
 		}
 
 		cmd := exec.CommandContext(ctx, agyBin, args...)
@@ -1356,6 +1682,36 @@ func handleStreamingCompletion(
 	}
 
 	writeSSE("data: [DONE]\n\n")
+
+	if !isAux && sessionKey != "" && activeConvID != "" && lastWaitErr == nil {
+		oldState := globalSessions.Get(sessionKey)
+		turns := 1
+		createdAt := time.Now()
+		if oldState != nil {
+			turns = oldState.TotalTurns + 1
+			createdAt = oldState.CreatedAt
+		}
+		globalSessions.Update(sessionKey, &SessionState{
+			ConvID:        activeConvID,
+			Model:         model,
+			CreatedAt:     createdAt,
+			LastSeen:      time.Now(),
+			MessageCount:  len(currentHashes),
+			HistoryHashes: currentHashes,
+			ToolsHash:     toolsHash,
+			TotalTurns:    turns,
+		})
+	} else if isAux && activeConvID != "" {
+		go func(cid string) {
+			time.Sleep(5 * time.Second)
+			for _, bDir := range brainDirs {
+				p := filepath.Join(bDir, cid)
+				if _, err := os.Stat(p); err == nil {
+					_ = os.RemoveAll(p)
+				}
+			}
+		}(activeConvID)
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -1367,7 +1723,11 @@ func handleNonStreamingCompletion(
 	args []string,
 	completionID, model string,
 	createdTs int64,
-	sessionKey, initialConvID, finalPrompt string,
+	sessionKey string,
+	isAux, isDelta bool,
+	initialConvID, finalPrompt, fallbackFullPrompt string,
+	currentHashes []string,
+	toolsHash string,
 ) {
 	select {
 	case agySem <- struct{}{}:
@@ -1386,6 +1746,31 @@ func handleNonStreamingCompletion(
 	for attempt := 1; attempt <= 2; attempt++ {
 		stdoutBuf.Reset()
 		stderrBuf.Reset()
+
+		if attempt > 1 {
+			log.Printf("[Proxy] Non-stream retry (attempt %d/2) for %s...", attempt, completionID)
+			if isDelta {
+				if ctx.Err() != nil || r.Context().Err() != nil {
+					log.Printf("[Proxy-Delta] Client disconnected/canceled for convID %s. Preserving session.", initialConvID)
+					return
+				}
+				log.Printf("[Proxy-Delta] Non-stream attempt 1 failed on convID %s. Falling back to fresh anchor.", initialConvID)
+				if sessionKey != "" {
+					globalSessions.Invalidate(sessionKey)
+				}
+				var filteredArgs []string
+				for idx := 0; idx < len(args); idx++ {
+					if args[idx] == "--conversation" {
+						idx++
+						continue
+					}
+					filteredArgs = append(filteredArgs, args[idx])
+				}
+				args = filteredArgs
+				finalPrompt = fallbackFullPrompt
+				isDelta = false
+			}
+		}
 
 		cmd := exec.CommandContext(ctx, agyBin, args...)
 		cmd.Dir = workspaceDir
@@ -1539,6 +1924,36 @@ func handleNonStreamingCompletion(
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(res)
+
+	if !isAux && sessionKey != "" && activeConvID != "" && waitErr == nil {
+		oldState := globalSessions.Get(sessionKey)
+		turns := 1
+		createdAt := time.Now()
+		if oldState != nil {
+			turns = oldState.TotalTurns + 1
+			createdAt = oldState.CreatedAt
+		}
+		globalSessions.Update(sessionKey, &SessionState{
+			ConvID:        activeConvID,
+			Model:         model,
+			CreatedAt:     createdAt,
+			LastSeen:      time.Now(),
+			MessageCount:  len(currentHashes),
+			HistoryHashes: currentHashes,
+			ToolsHash:     toolsHash,
+			TotalTurns:    turns,
+		})
+	} else if isAux && activeConvID != "" {
+		go func(cid string) {
+			time.Sleep(5 * time.Second)
+			for _, bDir := range brainDirs {
+				p := filepath.Join(bDir, cid)
+				if _, err := os.Stat(p); err == nil {
+					_ = os.RemoveAll(p)
+				}
+			}
+		}(activeConvID)
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -1611,6 +2026,10 @@ func authMiddleware(next http.Handler) http.Handler {
 func main() {
 	initWorkspace()
 
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	defer sessionCancel()
+	initSessionManager(sessionCtx)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /metrics", handleMetrics)
@@ -1645,6 +2064,8 @@ func main() {
 	go func() {
 		<-stop
 		log.Println("[Hermesgravity] Shutting down gracefully...")
+		sessionCancel()
+		globalSessions.flush()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(ctx)
