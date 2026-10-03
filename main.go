@@ -68,20 +68,13 @@ var (
 	workspaceDir = filepath.Join(os.Getenv("HOME"), ".hermes/anygravity_workspace")
 
 	fallbackModels = []ModelItem{
-		{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High)"},
-		{ID: "gemini-3.8-flash-medium", Name: "Gemini 3.8 Flash (Medium)"},
-		{ID: "gemini-3.8-flash-low", Name: "Gemini 3.8 Flash (Low)"},
-		{ID: "gemini-3.7-flash-high", Name: "Gemini 3.7 Flash (High)"},
-		{ID: "gemini-3.7-flash-medium", Name: "Gemini 3.7 Flash (Medium)"},
-		{ID: "gemini-3.7-flash-low", Name: "Gemini 3.7 Flash (Low)"},
-		{ID: "gemini-3.6-flash-high", Name: "Gemini 3.6 Flash (High)"},
-		{ID: "gemini-3.6-flash-medium", Name: "Gemini 3.6 Flash (Medium)"},
-		{ID: "gemini-3.6-flash-low", Name: "Gemini 3.6 Flash (Low)"},
-		{ID: "gemini-3.1-pro-high", Name: "Gemini 3.1 Pro (High)"},
-		{ID: "gemini-3.1-pro-low", Name: "Gemini 3.1 Pro (Low)"},
-		{ID: "claude-sonnet-4-6", Name: "Claude Sonnet 4.6 (Thinking)"},
-		{ID: "claude-opus-4-6-thinking", Name: "Claude Opus 4.6 (Thinking)"},
-		{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B (Medium)"},
+		{ID: "gemini-3.8-flash", Name: "Gemini 3.8 Flash"},
+		{ID: "gemini-3.7-flash", Name: "Gemini 3.7 Flash"},
+		{ID: "gemini-3.6-flash", Name: "Gemini 3.6 Flash"},
+		{ID: "gemini-3.1-pro", Name: "Gemini 3.1 Pro"},
+		{ID: "claude-sonnet-4-6", Name: "Claude Sonnet 4.6"},
+		{ID: "claude-opus-4-6-thinking", Name: "Claude Opus 4.6"},
+		{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B"},
 	}
 
 	agySem = make(chan struct{}, getMaxConcurrency())
@@ -1137,7 +1130,8 @@ func handleModelInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func resolveModel(m string) (string, error) {
+func resolveModelAndEffort(rawModel, rawEffort string) (model string, effort string, err error) {
+	m := rawModel
 	if strings.Contains(m, "/") {
 		parts := strings.Split(m, "/")
 		m = parts[len(parts)-1]
@@ -1147,47 +1141,96 @@ func resolveModel(m string) (string, error) {
 	m = strings.TrimSpace(strings.ToLower(m))
 
 	if m == "" || m == "auto" || m == "default" {
-		return "gemini-3.8-flash-high", nil
+		m = "gemini-3.8-flash"
 	}
 
-	for _, item := range registry.GetModels() {
-		if strings.EqualFold(item.ID, m) {
-			return item.ID, nil
+	eff := strings.ToLower(strings.TrimSpace(rawEffort))
+	eff = strings.ReplaceAll(eff, "-", "")
+	eff = strings.ReplaceAll(eff, "_", "")
+	eff = strings.ReplaceAll(eff, " ", "")
+
+	// Extract embedded effort from model name suffix if present
+	var embeddedEffort string
+	switch {
+	case strings.HasSuffix(m, "-high"):
+		embeddedEffort = "high"
+		m = strings.TrimSuffix(m, "-high")
+	case strings.HasSuffix(m, "-medium") || strings.HasSuffix(m, "-med"):
+		embeddedEffort = "medium"
+		m = strings.TrimSuffix(m, "-medium")
+		m = strings.TrimSuffix(m, "-med")
+	case strings.HasSuffix(m, "-low"):
+		embeddedEffort = "low"
+		m = strings.TrimSuffix(m, "-low")
+	}
+
+	// Resolve base model
+	switch {
+	case strings.Contains(m, "gemini-3.8") || strings.Contains(m, "flash-3.8"):
+		model = "gemini-3.8-flash"
+	case strings.Contains(m, "gemini-3.7") || strings.Contains(m, "flash-3.7"):
+		model = "gemini-3.7-flash"
+	case strings.Contains(m, "gemini-3.6") || strings.Contains(m, "flash-3.6"):
+		model = "gemini-3.6-flash"
+	case strings.Contains(m, "gemini-3.1-pro") || strings.Contains(m, "pro-3.1") || m == "gemini-3.1":
+		model = "gemini-3.1-pro"
+	case strings.Contains(m, "opus"):
+		model = "claude-opus-4-6-thinking"
+	case strings.Contains(m, "sonnet") || strings.Contains(m, "claude"):
+		model = "claude-sonnet-4-6"
+	case strings.Contains(m, "gpt-oss") || m == "gpt-oss-120b":
+		model = "gpt-oss-120b-medium"
+	default:
+		for _, item := range registry.GetModels() {
+			if strings.EqualFold(item.ID, m) {
+				model = item.ID
+				break
+			}
+		}
+		if model == "" {
+			return "", "", fmt.Errorf("unsupported model: %s", rawModel)
 		}
 	}
 
-	switch {
-	case strings.Contains(m, "gemini-3.8-flash-medium"):
-		return "gemini-3.8-flash-medium", nil
-	case strings.Contains(m, "gemini-3.8-flash-low"):
-		return "gemini-3.8-flash-low", nil
-	case strings.Contains(m, "gemini-3.8") || strings.Contains(m, "flash-3.8"):
-		return "gemini-3.8-flash-high", nil
-	case strings.Contains(m, "gemini-3.7-flash-medium"):
-		return "gemini-3.7-flash-medium", nil
-	case strings.Contains(m, "gemini-3.7-flash-low"):
-		return "gemini-3.7-flash-low", nil
-	case strings.Contains(m, "gemini-3.7") || strings.Contains(m, "flash-3.7"):
-		return "gemini-3.7-flash-high", nil
-	case strings.Contains(m, "gemini-3.6-flash-medium"):
-		return "gemini-3.6-flash-medium", nil
-	case strings.Contains(m, "gemini-3.6-flash-low"):
-		return "gemini-3.6-flash-low", nil
-	case strings.Contains(m, "gemini-3.6") || strings.Contains(m, "flash-3.6"):
-		return "gemini-3.6-flash-high", nil
-	case strings.Contains(m, "gemini-3.1-pro-low"):
-		return "gemini-3.1-pro-low", nil
-	case strings.Contains(m, "gemini-3.1-pro") || strings.Contains(m, "pro-3.1"):
-		return "gemini-3.1-pro-high", nil
-	case strings.Contains(m, "opus"):
-		return "claude-opus-4-6-thinking", nil
-	case strings.Contains(m, "sonnet") || strings.Contains(m, "claude"):
-		return "claude-sonnet-4-6", nil
-	case strings.Contains(m, "gpt-oss") || m == "gpt-oss-120b":
-		return "gpt-oss-120b-medium", nil
-	default:
-		return "", fmt.Errorf("unsupported model: %s", m)
+	// Determine effort based on model type
+	if strings.HasPrefix(model, "gemini-") {
+		chosenEffort := "high"
+		if eff != "" {
+			switch eff {
+			case "minimal", "low":
+				chosenEffort = "low"
+			case "medium", "med":
+				chosenEffort = "medium"
+			case "high", "xhigh", "extrahigh", "max", "ultra":
+				chosenEffort = "high"
+			}
+		} else if embeddedEffort != "" {
+			chosenEffort = embeddedEffort
+		}
+
+		if model == "gemini-3.1-pro" {
+			if chosenEffort == "medium" {
+				chosenEffort = "high"
+			}
+		}
+		effort = chosenEffort
+	} else {
+		// Claude and GPT-OSS models do NOT accept --effort in agy
+		effort = ""
 	}
+
+	return model, effort, nil
+}
+
+func resolveModel(m string) (string, error) {
+	model, effort, err := resolveModelAndEffort(m, "")
+	if err != nil {
+		return "", err
+	}
+	if strings.HasPrefix(model, "gemini-") && effort != "" {
+		return model + "-" + effort, nil
+	}
+	return model, nil
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -1224,7 +1267,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	model, err := resolveModel(req.Model)
+	model, effort, err := resolveModelAndEffort(req.Model, req.ReasoningEffort)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -1348,10 +1391,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		args = append(args, "--model", model)
 	}
 
-	effort := strings.ToLower(strings.TrimSpace(req.ReasoningEffort))
-	validEfforts := map[string]bool{"low": true, "medium": true, "high": true, "max": true, "none": true}
-	isGeminiBase := strings.HasPrefix(model, "gemini-") && !strings.HasSuffix(model, "-high") && !strings.HasSuffix(model, "-medium") && !strings.HasSuffix(model, "-low") && !strings.HasSuffix(model, "-max")
-	if isGeminiBase && effort != "" && validEfforts[effort] {
+	if effort != "" {
 		args = append(args, "--effort", effort)
 	}
 

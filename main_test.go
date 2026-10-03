@@ -436,3 +436,40 @@ func TestSessionManager_LRUEviction(t *testing.T) {
 	}
 }
 
+func TestResolveModelAndEffort(t *testing.T) {
+	cases := []struct {
+		modelIn     string
+		effortIn    string
+		wantModel   string
+		wantEffort  string
+		expectError bool
+	}{
+		{"gemini-3.8-flash-high", "", "gemini-3.8-flash", "high", false},
+		{"gemini-3.8-flash-high", "medium", "gemini-3.8-flash", "medium", false},
+		{"gemini-3.8-flash", "low", "gemini-3.8-flash", "low", false},
+		{"gemini-3.8-flash", "extra-high", "gemini-3.8-flash", "high", false},
+		{"gemini-3.8-flash", "ultra", "gemini-3.8-flash", "high", false},
+		{"gemini-3.1-pro", "medium", "gemini-3.1-pro", "high", false},
+		{"claude-sonnet-4-6", "high", "claude-sonnet-4-6", "", false},
+		{"claude-opus-4-6-thinking", "medium", "claude-opus-4-6-thinking", "", false},
+		{"auto", "", "gemini-3.8-flash", "high", false},
+		{"nonexistent-xyz", "", "", "", true},
+	}
+
+	for _, c := range cases {
+		m, eff, err := resolveModelAndEffort(c.modelIn, c.effortIn)
+		if c.expectError && err == nil {
+			t.Errorf("expected error for model=%q, got nil", c.modelIn)
+		}
+		if !c.expectError {
+			if err != nil {
+				t.Errorf("unexpected error for model=%q, eff=%q: %v", c.modelIn, c.effortIn, err)
+			}
+			if m != c.wantModel || eff != c.wantEffort {
+				t.Errorf("resolveModelAndEffort(%q, %q) = (%q, %q); want (%q, %q)",
+					c.modelIn, c.effortIn, m, eff, c.wantModel, c.wantEffort)
+			}
+		}
+	}
+}
+
