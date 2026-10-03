@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -206,7 +208,9 @@ func (sm *SessionManager) flush() {
 	data, err := json.MarshalIndent(sm.sessions, "", "  ")
 	sm.mu.RUnlock()
 	if err == nil {
-		_ = os.WriteFile(sm.filePath, data, 0644)
+		if writeErr := os.WriteFile(sm.filePath, data, 0644); writeErr != nil {
+			log.Printf("[SessionManager] flush error: %v", writeErr)
+		}
 	}
 }
 
@@ -250,11 +254,25 @@ func (sm *SessionManager) Update(key string, state *SessionState) {
 	oldState := sm.sessions[key]
 	sm.sessions[key] = state
 	if len(sm.sessions) > 500 {
-		for k := range sm.sessions {
-			delete(sm.sessions, k)
-			if len(sm.sessions) <= 400 {
-				break
+		type sessionAge struct {
+			key      string
+			lastSeen time.Time
+		}
+		var list []sessionAge
+		for k, v := range sm.sessions {
+			if k != key {
+				list = append(list, sessionAge{key: k, lastSeen: v.LastSeen})
 			}
+		}
+		sort.Slice(list, func(i, j int) bool {
+			return list[i].lastSeen.Before(list[j].lastSeen)
+		})
+		toRemove := len(sm.sessions) - 400
+		if toRemove > len(list) {
+			toRemove = len(list)
+		}
+		for i := 0; i < toRemove; i++ {
+			delete(sm.sessions, list[i].key)
 		}
 	}
 	sm.mu.Unlock()
@@ -264,6 +282,18 @@ func (sm *SessionManager) Update(key string, state *SessionState) {
 		log.Printf("[Proxy-Cleanup] Session %s migrated from conv %s to %s. Removing old conv folder.", key, oldState.ConvID, state.ConvID)
 		go func(oldCID string) {
 			time.Sleep(3 * time.Second)
+			sm.mu.RLock()
+			inUse := false
+			for _, s := range sm.sessions {
+				if s.ConvID == oldCID {
+					inUse = true
+					break
+				}
+			}
+			sm.mu.RUnlock()
+			if inUse {
+				return
+			}
 			for _, bDir := range brainDirs {
 				p := filepath.Join(bDir, oldCID)
 				if _, err := os.Stat(p); err == nil {
@@ -283,10 +313,15 @@ func (sm *SessionManager) Invalidate(key string) {
 
 func hashMessage(m ChatMessage) string {
 	h := sha256.New()
+	sep := []byte{0}
 	h.Write([]byte(m.Role))
+	h.Write(sep)
 	h.Write([]byte(m.Name))
+	h.Write(sep)
 	h.Write([]byte(m.ToolCallID))
+	h.Write(sep)
 	h.Write(m.Content)
+	h.Write(sep)
 	h.Write(m.ToolCalls)
 	return hex.EncodeToString(h.Sum(nil)[:8])
 }
@@ -301,9 +336,12 @@ func hashTools(tools []ToolItem) string {
 }
 
 func isAuxiliaryRequest(messages []ChatMessage, tools []ToolItem) bool {
-	for _, m := range messages {
+	if len(messages) == 0 {
+		return false
+	}
+	checkMsg := func(m ChatMessage) bool {
 		c := strings.ToLower(m.ContentString())
-		if strings.Contains(c, "you name chat sessions") ||
+		return strings.Contains(c, "you name chat sessions") ||
 			strings.Contains(c, "conversation summarizer") ||
 			strings.Contains(c, "extract facts") ||
 			strings.Contains(c, "generate a title") ||
@@ -312,7 +350,17 @@ func isAuxiliaryRequest(messages []ChatMessage, tools []ToolItem) bool {
 			strings.Contains(c, "review the conversation above and update") ||
 			strings.Contains(c, "update the skill library") ||
 			strings.Contains(c, "update two things:\n\n**memory**") ||
-			strings.Contains(c, "memory extraction") {
+			strings.Contains(c, "memory extraction")
+	}
+	if checkMsg(messages[0]) {
+		return true
+	}
+	start := 0
+	if len(messages) > 10 {
+		start = len(messages) - 10
+	}
+	for _, m := range messages[start:] {
+		if checkMsg(m) {
 			return true
 		}
 	}
@@ -353,7 +401,7 @@ func extractSessionKey(messages []ChatMessage, tools []ToolItem, headers http.He
 	h.Write([]byte(systemText))
 	h.Write([]byte("|"))
 	h.Write([]byte(firstUser))
-	return hex.EncodeToString(h.Sum(nil)[:12]), false
+	return hex.EncodeToString(h.Sum(nil)[:16]), false
 }
 
 // -----------------------------------------------------------------------------
@@ -643,10 +691,27 @@ func sanitizeJSON(raw string) string {
 				if i+1 < n {
 					nxt := raw[i+1]
 					switch nxt {
-					case '"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u':
+					case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
 						sb.WriteByte('\\')
 						sb.WriteByte(nxt)
 						i++
+					case 'u':
+						isHex := func(b byte) bool {
+							return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+						}
+						if i+5 < n && isHex(raw[i+2]) && isHex(raw[i+3]) && isHex(raw[i+4]) && isHex(raw[i+5]) {
+							sb.WriteByte('\\')
+							sb.WriteByte('u')
+							sb.WriteByte(raw[i+2])
+							sb.WriteByte(raw[i+3])
+							sb.WriteByte(raw[i+4])
+							sb.WriteByte(raw[i+5])
+							i += 5
+						} else {
+							sb.WriteString(`\\`)
+							sb.WriteByte('u')
+							i++
+						}
 					default:
 						// Invalid escape sequence like \` or \' or \$
 						// Treat the backslash as literal by escaping it.
@@ -779,12 +844,27 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 	cleanText = strings.TrimSpace(cleaned)
 	// When calling tools, any preamble monologue is model thinking/reasoning,
 	// never user-facing chat text. Clear cleanText so it does not leak to chat.
+	if len(toolCalls) > 1 {
+		var uniqueCalls []ParsedToolCall
+		seen := make(map[string]bool)
+		for _, tc := range toolCalls {
+			key := tc.Function.Name + "|" + tc.Function.Arguments
+			if !seen[key] {
+				seen[key] = true
+				tc.Index = len(uniqueCalls)
+				uniqueCalls = append(uniqueCalls, tc)
+			}
+		}
+		toolCalls = uniqueCalls
+	}
+
 	if len(toolCalls) > 0 {
 		cleanText = ""
 	} else if cleanText == "" && strings.TrimSpace(text) != "" {
 		// If no tool call was successfully parsed, don't drop the model's text into an empty response!
 		cleanText = strings.TrimSpace(text)
 	}
+
 	return cleanText, toolCalls
 }
 
@@ -799,8 +879,9 @@ func normalizeArgs(raw json.RawMessage) string {
 	}
 	var str string
 	if err := json.Unmarshal(raw, &str); err == nil {
-		if strings.HasPrefix(strings.TrimSpace(str), "{") {
-			return str
+		trimmed := strings.TrimSpace(str)
+		if strings.HasPrefix(trimmed, "{") {
+			return trimmed
 		}
 		b, _ := json.Marshal(map[string]string{"input": str})
 		return string(b)
@@ -812,9 +893,10 @@ func normalizeArgs(raw json.RawMessage) string {
 // Transcript Reasoning & Tools Extractor (Cached & Heap-Optimized)
 // -----------------------------------------------------------------------------
 type transcriptCacheEntry struct {
-	modTime   time.Time
-	fileSize  int64
-	reasoning string
+	modTime    time.Time
+	fileSize   int64
+	reasoning  string
+	accessedAt time.Time
 }
 
 var (
@@ -928,17 +1010,32 @@ func extractReasoningFromTranscript(convID string) string {
 
 	tCacheMu.Lock()
 	if len(tCache) > 100 {
-		for k := range tCache {
-			delete(tCache, k)
-			if len(tCache) <= 50 {
-				break
+		type cacheAge struct {
+			key        string
+			accessedAt time.Time
+		}
+		var list []cacheAge
+		for k, v := range tCache {
+			if k != convID {
+				list = append(list, cacheAge{key: k, accessedAt: v.accessedAt})
 			}
+		}
+		sort.Slice(list, func(i, j int) bool {
+			return list[i].accessedAt.Before(list[j].accessedAt)
+		})
+		toRemove := len(tCache) - 50
+		if toRemove > len(list) {
+			toRemove = len(list)
+		}
+		for i := 0; i < toRemove; i++ {
+			delete(tCache, list[i].key)
 		}
 	}
 	tCache[convID] = transcriptCacheEntry{
-		modTime:   fi.ModTime(),
-		fileSize:  fi.Size(),
-		reasoning: res,
+		modTime:    fi.ModTime(),
+		fileSize:   fi.Size(),
+		reasoning:  res,
+		accessedAt: time.Now(),
 	}
 	tCacheMu.Unlock()
 
@@ -948,12 +1045,17 @@ func extractReasoningFromTranscript(convID string) string {
 // -----------------------------------------------------------------------------
 // HTTP Handlers
 // -----------------------------------------------------------------------------
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type ChatCompletionRequest struct {
-	Model           string        `json:"model"`
-	Messages        []ChatMessage `json:"messages"`
-	Stream          bool          `json:"stream"`
-	Tools           []ToolItem    `json:"tools"`
-	ReasoningEffort string        `json:"reasoning_effort"`
+	Model           string         `json:"model"`
+	Messages        []ChatMessage  `json:"messages"`
+	Stream          bool           `json:"stream"`
+	StreamOptions   *StreamOptions `json:"stream_options,omitempty"`
+	Tools           []ToolItem     `json:"tools"`
+	ReasoningEffort string         `json:"reasoning_effort"`
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -1147,7 +1249,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	toolsHash := hashTools(req.Tools)
 
 	var activeState *SessionState
-	if !isAux && sessionKey != "" && convID == "" {
+	if !isAux && sessionKey != "" {
 		activeState = globalSessions.Get(sessionKey)
 	}
 
@@ -1161,10 +1263,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if activeState != nil && activeState.ConvID != "" && activeState.Model == model && activeState.ToolsHash == toolsHash {
 		if len(req.Messages) > activeState.MessageCount {
 			prefixOK := true
-			for i := 0; i < activeState.MessageCount; i++ {
-				if currentHashes[i] != activeState.HistoryHashes[i] {
-					prefixOK = false
-					break
+			if len(activeState.HistoryHashes) < activeState.MessageCount || len(currentHashes) < activeState.MessageCount {
+				prefixOK = false
+			} else {
+				for i := 0; i < activeState.MessageCount; i++ {
+					if currentHashes[i] != activeState.HistoryHashes[i] {
+						prefixOK = false
+						break
+					}
 				}
 			}
 
@@ -1180,10 +1286,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		} else if len(req.Messages) == activeState.MessageCount && activeState.MessageCount > 0 {
 			prefixOK := true
-			for i := 0; i < activeState.MessageCount-1; i++ {
-				if currentHashes[i] != activeState.HistoryHashes[i] {
-					prefixOK = false
-					break
+			if len(activeState.HistoryHashes) < activeState.MessageCount || len(currentHashes) < activeState.MessageCount {
+				prefixOK = false
+			} else {
+				for i := 0; i < activeState.MessageCount-1; i++ {
+					if currentHashes[i] != activeState.HistoryHashes[i] {
+						prefixOK = false
+						break
+					}
 				}
 			}
 			if prefixOK {
@@ -1238,9 +1348,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		args = append(args, "--model", model)
 	}
 
-	effort := req.ReasoningEffort
+	effort := strings.ToLower(strings.TrimSpace(req.ReasoningEffort))
+	validEfforts := map[string]bool{"low": true, "medium": true, "high": true, "max": true, "none": true}
 	isGeminiBase := strings.HasPrefix(model, "gemini-") && !strings.HasSuffix(model, "-high") && !strings.HasSuffix(model, "-medium") && !strings.HasSuffix(model, "-low") && !strings.HasSuffix(model, "-max")
-	if isGeminiBase && effort != "" {
+	if isGeminiBase && effort != "" && validEfforts[effort] {
 		args = append(args, "--effort", effort)
 	}
 
@@ -1264,7 +1375,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		handleStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, isAux, isDelta, convID, finalPrompt, fallbackFullPrompt, currentHashes, toolsHash, len(req.Tools) > 0, promptTokens)
+		includeUsageChunk := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+		handleStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, isAux, isDelta, convID, finalPrompt, fallbackFullPrompt, currentHashes, toolsHash, len(req.Tools) > 0, promptTokens, includeUsageChunk)
 	} else {
 		handleNonStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, isAux, isDelta, convID, finalPrompt, fallbackFullPrompt, currentHashes, toolsHash, promptTokens)
 	}
@@ -1286,6 +1398,7 @@ func handleStreamingCompletion(
 	toolsHash string,
 	hasTools bool,
 	promptTokens int,
+	includeUsageChunk bool,
 ) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1381,6 +1494,11 @@ func handleStreamingCompletion(
 	defer ticker.Stop()
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[Proxy] Heartbeat recovered: %v", r)
+			}
+		}()
 		for {
 			select {
 			case <-ticker.C:
@@ -1430,6 +1548,7 @@ func handleStreamingCompletion(
 				args = filteredArgs
 				finalPrompt = fallbackFullPrompt
 				isDelta = false
+				activeConvID = ""
 			}
 		}
 
@@ -1456,7 +1575,10 @@ func handleStreamingCompletion(
 		}
 
 		var stderrBuf bytes.Buffer
+		var stderrWg sync.WaitGroup
+		stderrWg.Add(1)
 		go func() {
+			defer stderrWg.Done()
 			_, _ = io.Copy(&stderrBuf, stderr)
 		}()
 
@@ -1467,17 +1589,23 @@ func handleStreamingCompletion(
 		}
 
 		var processExited atomic.Bool
+		doneProcess := make(chan struct{})
 		go func() {
-			<-ctx.Done()
-			if !processExited.Load() && cmd.Process != nil {
-				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			select {
+			case <-ctx.Done():
+				if !processExited.Load() && cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+			case <-doneProcess:
 			}
 		}()
 
 		// Stream prompt through StdinPipe in background
 		go func() {
 			defer stdin.Close()
-			_, _ = io.WriteString(stdin, finalPrompt+"\n")
+			if _, err := io.WriteString(stdin, finalPrompt+"\n"); err != nil {
+				log.Printf("[Proxy] stdin write error: %v", err)
+			}
 		}()
 
 		type streamEvent struct {
@@ -1495,10 +1623,18 @@ func handleStreamingCompletion(
 				raw := scanner.Bytes()
 				b := make([]byte, len(raw))
 				copy(b, raw)
-				eventChan <- streamEvent{line: b}
+				select {
+				case eventChan <- streamEvent{line: b}:
+				case <-ctx.Done():
+					return
+				}
 			}
 			if err := scanner.Err(); err != nil {
-				eventChan <- streamEvent{err: err}
+				select {
+				case eventChan <- streamEvent{err: err}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}()
 
@@ -1541,7 +1677,7 @@ func handleStreamingCompletion(
 						pending := streamPending.String()
 
 						// 1. Check if any complete tool marker is present
-						markers := []string{"<tool_call>", "<function_call>", "call:", "tool_call"}
+						markers := []string{"<tool_call>", "<function_call>", "call:default_api:", "```tool_call"}
 						toolMarkerIdx := -1
 						for _, m := range markers {
 							if idx := strings.Index(pending, m); idx != -1 {
@@ -1608,6 +1744,8 @@ func handleStreamingCompletion(
 
 		lastWaitErr = cmd.Wait()
 		processExited.Store(true)
+		close(doneProcess)
+		stderrWg.Wait()
 		lastStderr = strings.TrimSpace(stderrBuf.String())
 
 		// If success or we got output, break retry loop
@@ -1684,25 +1822,14 @@ func handleStreamingCompletion(
 	}
 
 	// Flush remaining clean text if not streamed yet
-	unstreamed := cleanText
+	unstreamed := ""
 	alreadyStreamed := streamedText.String()
-	if alreadyStreamed != "" {
-		if strings.HasPrefix(cleanText, alreadyStreamed) {
-			unstreamed = strings.TrimPrefix(cleanText, alreadyStreamed)
-		} else if strings.Contains(cleanText, alreadyStreamed) {
-			idx := strings.Index(cleanText, alreadyStreamed)
-			unstreamed = cleanText[idx+len(alreadyStreamed):]
-		} else {
-			trimmedClean := strings.TrimSpace(cleanText)
-			trimmedStreamed := strings.TrimSpace(alreadyStreamed)
-			if strings.HasPrefix(trimmedClean, trimmedStreamed) {
-				unstreamed = strings.TrimSpace(strings.TrimPrefix(trimmedClean, trimmedStreamed))
-			} else if len(toolCalls) == 0 && len(trimmedClean) > len(trimmedStreamed) {
-				unstreamed = "\n\n" + cleanText
-			} else {
-				unstreamed = ""
-			}
-		}
+	if alreadyStreamed == "" {
+		unstreamed = cleanText
+	} else if strings.HasPrefix(cleanText, alreadyStreamed) {
+		unstreamed = cleanText[len(alreadyStreamed):]
+	} else if trimmedStreamed := strings.TrimRight(alreadyStreamed, " \t\r\n"); strings.HasPrefix(cleanText, trimmedStreamed) {
+		unstreamed = strings.TrimPrefix(cleanText, trimmedStreamed)
 	}
 	if unstreamed != "" {
 		txtChunk := map[string]interface{}{
@@ -1742,21 +1869,62 @@ func handleStreamingCompletion(
 	}
 
 	if len(toolCalls) > 0 {
-		tcChunk := map[string]interface{}{
-			"id":      completionID,
-			"object":  "chat.completion.chunk",
-			"created": createdTs,
-			"model":   model,
-			"choices": []map[string]interface{}{
-				{
-					"index":         0,
-					"delta":         map[string]interface{}{"tool_calls": toolCalls},
-					"finish_reason": nil,
+		for i, tc := range toolCalls {
+			// Chunk 1: Announce tool call with name and ID
+			chunkName := map[string]interface{}{
+				"id":      completionID,
+				"object":  "chat.completion.chunk",
+				"created": createdTs,
+				"model":   model,
+				"choices": []map[string]interface{}{
+					{
+						"index": 0,
+						"delta": map[string]interface{}{
+							"tool_calls": []map[string]interface{}{
+								{
+									"index": i,
+									"id":    tc.ID,
+									"type":  "function",
+									"function": map[string]string{
+										"name":      tc.Function.Name,
+										"arguments": "",
+									},
+								},
+							},
+						},
+						"finish_reason": nil,
+					},
 				},
-			},
+			}
+			cnb, _ := json.Marshal(chunkName)
+			writeSSE(fmt.Sprintf("data: %s\n\n", cnb))
+
+			// Chunk 2: Stream complete arguments
+			chunkArgs := map[string]interface{}{
+				"id":      completionID,
+				"object":  "chat.completion.chunk",
+				"created": createdTs,
+				"model":   model,
+				"choices": []map[string]interface{}{
+					{
+						"index": 0,
+						"delta": map[string]interface{}{
+							"tool_calls": []map[string]interface{}{
+								{
+									"index": i,
+									"function": map[string]string{
+										"arguments": tc.Function.Arguments,
+									},
+								},
+							},
+						},
+						"finish_reason": nil,
+					},
+				},
+			}
+			cab, _ := json.Marshal(chunkArgs)
+			writeSSE(fmt.Sprintf("data: %s\n\n", cab))
 		}
-		tcb, _ := json.Marshal(tcChunk)
-		writeSSE(fmt.Sprintf("data: %s\n\n", tcb))
 
 		finChunk := map[string]interface{}{
 			"id":      completionID,
@@ -1770,7 +1938,9 @@ func handleStreamingCompletion(
 					"finish_reason": "tool_calls",
 				},
 			},
-			"usage": usageMap,
+		}
+		if !includeUsageChunk {
+			finChunk["usage"] = usageMap
 		}
 		finBytes, _ := json.Marshal(finChunk)
 		writeSSE(fmt.Sprintf("data: %s\n\n", finBytes))
@@ -1787,23 +1957,27 @@ func handleStreamingCompletion(
 					"finish_reason": "stop",
 				},
 			},
-			"usage": usageMap,
+		}
+		if !includeUsageChunk {
+			stopChunk["usage"] = usageMap
 		}
 		sb, _ := json.Marshal(stopChunk)
 		writeSSE(fmt.Sprintf("data: %s\n\n", sb))
 	}
 
-	// Dedicated usage chunk matching standard OpenAI SSE stream_options
-	usageChunk := map[string]interface{}{
-		"id":      completionID,
-		"object":  "chat.completion.chunk",
-		"created": createdTs,
-		"model":   model,
-		"choices": []map[string]interface{}{},
-		"usage":   usageMap,
+	if includeUsageChunk {
+		// Dedicated usage chunk matching standard OpenAI SSE stream_options: {include_usage: true}
+		usageChunk := map[string]interface{}{
+			"id":      completionID,
+			"object":  "chat.completion.chunk",
+			"created": createdTs,
+			"model":   model,
+			"choices": []map[string]interface{}{},
+			"usage":   usageMap,
+		}
+		ub, _ := json.Marshal(usageChunk)
+		writeSSE(fmt.Sprintf("data: %s\n\n", ub))
 	}
-	ub, _ := json.Marshal(usageChunk)
-	writeSSE(fmt.Sprintf("data: %s\n\n", ub))
 
 	writeSSE("data: [DONE]\n\n")
 
@@ -1912,15 +2086,20 @@ func handleNonStreamingCompletion(
 		}
 
 		var processExited atomic.Bool
+		doneProcess := make(chan struct{})
 		go func(c *exec.Cmd) {
-			<-ctx.Done()
-			if !processExited.Load() && c.Process != nil {
-				_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+			select {
+			case <-ctx.Done():
+				if !processExited.Load() && c.Process != nil {
+					_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+				}
+			case <-doneProcess:
 			}
 		}(cmd)
 
 		waitErr = cmd.Wait()
 		processExited.Store(true)
+		close(doneProcess)
 
 		if waitErr == nil {
 			break
@@ -2140,7 +2319,7 @@ func authMiddleware(next http.Handler) http.Handler {
 			authHeader := r.Header.Get("Authorization")
 			token := strings.TrimPrefix(authHeader, "Bearer ")
 			token = strings.TrimSpace(token)
-			if token != apiKey {
+			if subtle.ConstantTimeCompare([]byte(token), []byte(apiKey)) != 1 {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
 				_ = json.NewEncoder(w).Encode(map[string]interface{}{

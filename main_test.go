@@ -2,11 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseToolCalls_TagFormat(t *testing.T) {
@@ -98,8 +101,8 @@ func TestExtractSessionKey(t *testing.T) {
 	if isAux2 {
 		t.Errorf("expected isAux2=false, got true")
 	}
-	if len(key2) != 24 {
-		t.Errorf("expected 24-hex-char hash, got %s (len=%d)", key2, len(key2))
+	if len(key2) != 32 {
+		t.Errorf("expected 32-hex-char hash, got %s (len=%d)", key2, len(key2))
 	}
 
 	// Test auxiliary request detection
@@ -220,7 +223,7 @@ func TestSlidingWindowMarkerDetection(t *testing.T) {
 	chunk1 := "Hello! Let me execute that for you: <tool_"
 	chunk2 := "call>\n{\"name\": \"run_cmd\", \"arguments\": {\"cmd\": \"ls\"}}\n</tool_call>"
 
-	markers := []string{"<tool_call>", "<function_call>", "call:", "tool_call"}
+	markers := []string{"<tool_call>", "<function_call>", "call:default_api:", "```tool_call"}
 
 	var streamPending strings.Builder
 	var streamed strings.Builder
@@ -360,3 +363,76 @@ func TestIsAuxiliaryRequest_WithTools(t *testing.T) {
 		t.Errorf("expected isAuxiliaryRequest=true even when tools are present")
 	}
 }
+
+func TestSanitizeJSON_UnicodeEscapes(t *testing.T) {
+	// Valid \u escape
+	validInput := `{"str": "\u0041"}`
+	validSan := sanitizeJSON(validInput)
+	var validObj map[string]string
+	if err := json.Unmarshal([]byte(validSan), &validObj); err != nil {
+		t.Fatalf("failed to unmarshal valid unicode: %v", err)
+	}
+	if validObj["str"] != "A" {
+		t.Errorf("expected 'A', got %q", validObj["str"])
+	}
+
+	// Invalid \u escape like \user or \u12
+	invalidInput := `{"path": "C:\user\test\u12"}`
+	invalidSan := sanitizeJSON(invalidInput)
+	var invalidObj map[string]string
+	if err := json.Unmarshal([]byte(invalidSan), &invalidObj); err != nil {
+		t.Fatalf("failed to unmarshal sanitized invalid unicode: %v", err)
+	}
+	if !strings.Contains(invalidObj["path"], "user") {
+		t.Errorf("expected path to contain 'user', got %q", invalidObj["path"])
+	}
+}
+
+func TestParseToolCalls_Deduplication(t *testing.T) {
+	input := "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}</tool_call>\n" +
+		"<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}</tool_call>"
+
+	_, toolCalls := parseToolCalls(input)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 deduplicated tool call, got %d", len(toolCalls))
+	}
+	if toolCalls[0].Function.Name != "get_weather" {
+		t.Errorf("expected get_weather, got %s", toolCalls[0].Function.Name)
+	}
+}
+
+func TestSessionManager_LRUEviction(t *testing.T) {
+	sm := &SessionManager{
+		filePath: filepath.Join(t.TempDir(), "sessions.json"),
+		sessions: make(map[string]*SessionState),
+		trigger:  make(chan struct{}, 1),
+	}
+	baseTime := time.Now().Add(-1 * time.Hour)
+
+	// Fill with 501 sessions
+	for i := 0; i < 501; i++ {
+		key := fmt.Sprintf("sess_%04d", i)
+		sm.Update(key, &SessionState{
+			ConvID:    fmt.Sprintf("conv_%04d", i),
+			LastSeen:  baseTime.Add(time.Duration(i) * time.Minute),
+			CreatedAt: baseTime,
+		})
+	}
+
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if len(sm.sessions) > 405 {
+		t.Errorf("expected <= 405 sessions after LRU eviction, got %d", len(sm.sessions))
+	}
+
+	// Oldest session (sess_0000) should have been evicted
+	if _, exists := sm.sessions["sess_0000"]; exists {
+		t.Errorf("expected oldest session sess_0000 to be evicted")
+	}
+
+	// Newest session (sess_0500) should definitely be retained
+	if _, exists := sm.sessions["sess_0500"]; !exists {
+		t.Errorf("expected newest session sess_0500 to be preserved")
+	}
+}
+
