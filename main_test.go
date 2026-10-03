@@ -300,3 +300,63 @@ func TestSlidingWindowMarkerDetection(t *testing.T) {
 		t.Errorf("leaked tool call in streamed text: %q", streamed.String())
 	}
 }
+
+func TestSanitizeJSON_RawNewlinesAndInvalidEscapes(t *testing.T) {
+	raw := "{\"name\": \"terminal\", \"arguments\": {\"command\": \"ssh oracle \\\"cat << 'EOF' > /file\nline 1 \\`var\\`\nline 2 \\'single\\'\nEOF\\\"\"}}"
+	sanitized := sanitizeJSON(raw)
+
+	var parsed struct {
+		Name      string `json:"name"`
+		Arguments struct {
+			Command string `json:"command"`
+		} `json:"arguments"`
+	}
+	if err := json.Unmarshal([]byte(sanitized), &parsed); err != nil {
+		t.Fatalf("failed to unmarshal sanitized JSON: %v", err)
+	}
+	if parsed.Name != "terminal" {
+		t.Errorf("expected terminal, got %s", parsed.Name)
+	}
+	if !strings.Contains(parsed.Arguments.Command, "line 1") || !strings.Contains(parsed.Arguments.Command, "line 2") {
+		t.Errorf("command missing content: %s", parsed.Arguments.Command)
+	}
+}
+
+func TestParseToolCalls_MultilineScript(t *testing.T) {
+	input := "<tool_call>\n" +
+		"{\"name\": \"terminal\", \"arguments\": {\"command\": \"ssh oracle \\\"cat << 'EOF' > /home/ubuntu/Iris/lib/Commands/Eleicao/index.js\n" +
+		"/* eslint-disable max-len */\n" +
+		"const envInfo = (\\`envInfo\\`);\n" +
+		"export default resetLocal();\n" +
+		"EOF\\\"\"}}\n" +
+		"</tool_call>"
+
+	cleanText, toolCalls := parseToolCalls(input)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call parsed, got %d", len(toolCalls))
+	}
+	if toolCalls[0].Function.Name != "terminal" {
+		t.Errorf("expected tool terminal, got %s", toolCalls[0].Function.Name)
+	}
+	if !strings.Contains(toolCalls[0].Function.Arguments, "eslint-disable") {
+		t.Errorf("expected script content in arguments, got %s", toolCalls[0].Function.Arguments)
+	}
+	if cleanText != "" {
+		t.Errorf("expected cleanText to be empty when tool call parsed, got %q", cleanText)
+	}
+}
+
+func TestIsAuxiliaryRequest_WithTools(t *testing.T) {
+	msgs := []ChatMessage{
+		{
+			Role:    "user",
+			Content: json.RawMessage(`"Review the conversation above and update the skill library. Be ACTIVE — most sessions develop patterns..."`),
+		},
+	}
+	tools := []ToolItem{
+		{Type: "function", Function: FunctionDef{Name: "view_file"}},
+	}
+	if !isAuxiliaryRequest(msgs, tools) {
+		t.Errorf("expected isAuxiliaryRequest=true even when tools are present")
+	}
+}

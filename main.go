@@ -301,20 +301,19 @@ func hashTools(tools []ToolItem) string {
 }
 
 func isAuxiliaryRequest(messages []ChatMessage, tools []ToolItem) bool {
-	if len(tools) == 0 {
-		for _, m := range messages {
-			c := strings.ToLower(m.ContentString())
-			if strings.Contains(c, "you name chat sessions") ||
-				strings.Contains(c, "conversation summarizer") ||
-				strings.Contains(c, "extract facts") ||
-				strings.Contains(c, "generate a title") ||
-				strings.Contains(c, "the following command was flagged as:") ||
-				strings.Contains(c, "command execution confirmation") ||
-				strings.Contains(c, "review the conversation above and update") ||
-				strings.Contains(c, "update two things:\n\n**memory**") ||
-				strings.Contains(c, "memory extraction") {
-				return true
-			}
+	for _, m := range messages {
+		c := strings.ToLower(m.ContentString())
+		if strings.Contains(c, "you name chat sessions") ||
+			strings.Contains(c, "conversation summarizer") ||
+			strings.Contains(c, "extract facts") ||
+			strings.Contains(c, "generate a title") ||
+			strings.Contains(c, "the following command was flagged as:") ||
+			strings.Contains(c, "command execution confirmation") ||
+			strings.Contains(c, "review the conversation above and update") ||
+			strings.Contains(c, "update the skill library") ||
+			strings.Contains(c, "update two things:\n\n**memory**") ||
+			strings.Contains(c, "memory extraction") {
+			return true
 		}
 	}
 	return false
@@ -430,13 +429,13 @@ func formatToolsPrompt(tools []ToolItem) string {
 
 [CRITICAL INSTRUCTIONS FOR AI AGENT COMPLETION]
 You are acting as the backend AI completion model for an external AI Agent.
-- You DO NOT have permission to use or call any local system tools directly.
-- When a tool is needed, you MUST choose from [AVAILABLE TOOLS] and respond ONLY with the exact tag:
+- You DO NOT have permission to use or execute any local system tools directly.
+- When an action or information retrieval is genuinely needed, choose from [AVAILABLE TOOLS] and respond ONLY with:
 <tool_call>
 {"name": "tool_name", "arguments": {"param": "value"}}
 </tool_call>
 - Do NOT output commentary or conversational filler before or after the <tool_call> tag when calling a tool.
-- If no tool is needed, respond directly to the user in normal helpful text.
+- IMPORTANT COMPLETION RULE: Once the tool output provides the necessary data or the requested action has been performed, DO NOT call any more tools. Respond directly to the user in normal, helpful text with your final answer, confirmation, or summary.
 `, string(b))
 }
 
@@ -492,9 +491,10 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 
 	if toolsPrompt != "" {
 		sb.WriteString("[CRITICAL REMINDER]\n")
-		sb.WriteString("You are strictly the completion engine for the AI Agent. Do NOT invoke local tools directly.\n")
-		sb.WriteString("When calling a tool from [AVAILABLE TOOLS], respond ONLY with:\n")
-		sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n\n")
+		sb.WriteString("You are the completion engine for the AI Agent. Do NOT invoke local tools directly.\n")
+		sb.WriteString("- If an action/tool call is genuinely needed, respond ONLY with:\n")
+		sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n")
+		sb.WriteString("- If the user request is satisfied or no further tool is needed, DO NOT call tools. Respond directly in normal text with your final response.\n\n")
 	}
 
 	sb.WriteString("Assistant:")
@@ -554,9 +554,10 @@ func formatDeltaPrompt(messages []ChatMessage, startIndex int) string {
 	}
 
 	sb.WriteString("[CRITICAL REMINDER]\n")
-	sb.WriteString("You are strictly the completion engine for the AI Agent. Do NOT invoke local tools directly.\n")
-	sb.WriteString("When calling a tool from [AVAILABLE TOOLS], respond ONLY with:\n")
-	sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n\n")
+	sb.WriteString("You are the completion engine for the AI Agent. Do NOT invoke local tools directly.\n")
+	sb.WriteString("- If an action/tool call is genuinely needed, respond ONLY with:\n")
+	sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n")
+	sb.WriteString("- If the previous tool result is sufficient or the task is finished, DO NOT call more tools. Respond directly to the user in normal text with your final response.\n\n")
 	sb.WriteString("Assistant:")
 
 	return sb.String()
@@ -625,6 +626,54 @@ func nextToolCallID() string {
 	return fmt.Sprintf("call_%d_%x", n, time.Now().UnixNano()&0xffff)
 }
 
+func sanitizeJSON(raw string) string {
+	var sb strings.Builder
+	sb.Grow(len(raw) + 64)
+	inString := false
+	n := len(raw)
+	for i := 0; i < n; i++ {
+		ch := raw[i]
+		if !inString {
+			if ch == '"' {
+				inString = true
+			}
+			sb.WriteByte(ch)
+		} else {
+			if ch == '\\' {
+				if i+1 < n {
+					nxt := raw[i+1]
+					switch nxt {
+					case '"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u':
+						sb.WriteByte('\\')
+						sb.WriteByte(nxt)
+						i++
+					default:
+						// Invalid escape sequence like \` or \' or \$
+						// Treat the backslash as literal by escaping it.
+						sb.WriteString(`\\`)
+						sb.WriteByte(nxt)
+						i++
+					}
+				} else {
+					sb.WriteString(`\\`)
+				}
+			} else if ch == '"' {
+				inString = false
+				sb.WriteByte(ch)
+			} else if ch == '\n' {
+				sb.WriteString(`\n`)
+			} else if ch == '\r' {
+				sb.WriteString(`\r`)
+			} else if ch == '\t' {
+				sb.WriteString(`\t`)
+			} else {
+				sb.WriteByte(ch)
+			}
+		}
+	}
+	return sb.String()
+}
+
 func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) {
 	cleaned := text
 
@@ -640,7 +689,11 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
 		}
-		if err := json.Unmarshal([]byte(raw), &single); err == nil && single.Name != "" {
+		if err := json.Unmarshal([]byte(raw), &single); err != nil {
+			sanitized := sanitizeJSON(raw)
+			_ = json.Unmarshal([]byte(sanitized), &single)
+		}
+		if single.Name != "" {
 			tc := ParsedToolCall{
 				Index: len(toolCalls),
 				ID:    nextToolCallID(),
@@ -660,7 +713,11 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
 		}
-		if err := json.Unmarshal([]byte(raw), &single); err == nil && single.Name != "" {
+		if err := json.Unmarshal([]byte(raw), &single); err != nil {
+			sanitized := sanitizeJSON(raw)
+			_ = json.Unmarshal([]byte(sanitized), &single)
+		}
+		if single.Name != "" {
 			tc := ParsedToolCall{
 				Index: len(toolCalls),
 				ID:    nextToolCallID(),
@@ -687,7 +744,11 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
 		}
-		if err := json.Unmarshal([]byte(jsonStr), &single); err == nil && single.Name != "" {
+		if err := json.Unmarshal([]byte(jsonStr), &single); err != nil {
+			sanitized := sanitizeJSON(jsonStr)
+			_ = json.Unmarshal([]byte(sanitized), &single)
+		}
+		if single.Name != "" {
 			tc := ParsedToolCall{
 				Index: len(toolCalls),
 				ID:    nextToolCallID(),
@@ -720,6 +781,9 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 	// never user-facing chat text. Clear cleanText so it does not leak to chat.
 	if len(toolCalls) > 0 {
 		cleanText = ""
+	} else if cleanText == "" && strings.TrimSpace(text) != "" {
+		// If no tool call was successfully parsed, don't drop the model's text into an empty response!
+		cleanText = strings.TrimSpace(text)
 	}
 	return cleanText, toolCalls
 }
@@ -1184,10 +1248,25 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		args = append(args, "--conversation", convID)
 	}
 
+	totalPromptChars := 0
+	for _, m := range req.Messages {
+		totalPromptChars += len(m.Role) + len(m.Content) + len(m.Name) + len(m.ToolCalls)
+	}
+	for _, t := range req.Tools {
+		totalPromptChars += len(t.Type) + len(t.Function.Name) + len(t.Function.Description) + len(t.Function.Parameters)
+	}
+	promptTokens := totalPromptChars / 4
+	if promptTokens < 1 {
+		promptTokens = len(finalPrompt) / 4
+	}
+	if promptTokens < 1 {
+		promptTokens = 1
+	}
+
 	if req.Stream {
-		handleStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, isAux, isDelta, convID, finalPrompt, fallbackFullPrompt, currentHashes, toolsHash, len(req.Tools) > 0)
+		handleStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, isAux, isDelta, convID, finalPrompt, fallbackFullPrompt, currentHashes, toolsHash, len(req.Tools) > 0, promptTokens)
 	} else {
-		handleNonStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, isAux, isDelta, convID, finalPrompt, fallbackFullPrompt, currentHashes, toolsHash)
+		handleNonStreamingCompletion(w, r, args, completionID, model, createdTs, sessionKey, isAux, isDelta, convID, finalPrompt, fallbackFullPrompt, currentHashes, toolsHash, promptTokens)
 	}
 }
 
@@ -1206,6 +1285,7 @@ func handleStreamingCompletion(
 	currentHashes []string,
 	toolsHash string,
 	hasTools bool,
+	promptTokens int,
 ) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1613,7 +1693,15 @@ func handleStreamingCompletion(
 			idx := strings.Index(cleanText, alreadyStreamed)
 			unstreamed = cleanText[idx+len(alreadyStreamed):]
 		} else {
-			unstreamed = ""
+			trimmedClean := strings.TrimSpace(cleanText)
+			trimmedStreamed := strings.TrimSpace(alreadyStreamed)
+			if strings.HasPrefix(trimmedClean, trimmedStreamed) {
+				unstreamed = strings.TrimSpace(strings.TrimPrefix(trimmedClean, trimmedStreamed))
+			} else if len(toolCalls) == 0 && len(trimmedClean) > len(trimmedStreamed) {
+				unstreamed = "\n\n" + cleanText
+			} else {
+				unstreamed = ""
+			}
 		}
 	}
 	if unstreamed != "" {
@@ -1632,6 +1720,25 @@ func handleStreamingCompletion(
 		}
 		tb, _ := json.Marshal(txtChunk)
 		writeSSE(fmt.Sprintf("data: %s\n\n", tb))
+	}
+
+	inTok := promptTokens
+	if inTok < 1 {
+		inTok = len(finalPrompt) / 4
+	}
+	if inTok < 1 {
+		inTok = 1
+	}
+	outTok := (accumulatedText.Len() + len(reasoning)) / 4
+	if outTok < 1 {
+		outTok = 1
+	}
+	totalTok := inTok + outTok
+
+	usageMap := map[string]interface{}{
+		"prompt_tokens":     inTok,
+		"completion_tokens": outTok,
+		"total_tokens":      totalTok,
 	}
 
 	if len(toolCalls) > 0 {
@@ -1663,6 +1770,7 @@ func handleStreamingCompletion(
 					"finish_reason": "tool_calls",
 				},
 			},
+			"usage": usageMap,
 		}
 		finBytes, _ := json.Marshal(finChunk)
 		writeSSE(fmt.Sprintf("data: %s\n\n", finBytes))
@@ -1679,10 +1787,23 @@ func handleStreamingCompletion(
 					"finish_reason": "stop",
 				},
 			},
+			"usage": usageMap,
 		}
 		sb, _ := json.Marshal(stopChunk)
 		writeSSE(fmt.Sprintf("data: %s\n\n", sb))
 	}
+
+	// Dedicated usage chunk matching standard OpenAI SSE stream_options
+	usageChunk := map[string]interface{}{
+		"id":      completionID,
+		"object":  "chat.completion.chunk",
+		"created": createdTs,
+		"model":   model,
+		"choices": []map[string]interface{}{},
+		"usage":   usageMap,
+	}
+	ub, _ := json.Marshal(usageChunk)
+	writeSSE(fmt.Sprintf("data: %s\n\n", ub))
 
 	writeSSE("data: [DONE]\n\n")
 
@@ -1731,6 +1852,7 @@ func handleNonStreamingCompletion(
 	initialConvID, finalPrompt, fallbackFullPrompt string,
 	currentHashes []string,
 	toolsHash string,
+	promptTokens int,
 ) {
 	select {
 	case agySem <- struct{}{}:
@@ -1898,12 +2020,22 @@ func handleNonStreamingCompletion(
 	}
 
 	inTok := agyRes.Usage.InputTokens
-	outTok := agyRes.Usage.OutputTokens
 	if inTok == 0 {
+		inTok = promptTokens
+	}
+	if inTok < 1 {
 		inTok = len(finalPrompt) / 4
 	}
+	if inTok < 1 {
+		inTok = 1
+	}
+
+	outTok := agyRes.Usage.OutputTokens
 	if outTok == 0 {
-		outTok = len(respText) / 4
+		outTok = (len(respText) + len(reasoning)) / 4
+	}
+	if outTok < 1 {
+		outTok = 1
 	}
 
 	res := map[string]interface{}{
