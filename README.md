@@ -193,20 +193,16 @@ mcp_servers:
 
 Anygravity dynamically queries and supports the models available on your local `agy` installation:
 
-| Model ID | Name | Description |
+| Model ID | Name | Notes |
 | :--- | :--- | :--- |
-| `gemini-3.8-flash-high` | Gemini 3.8 Flash (High) | **Default** - Ultra-fast inference with high reasoning effort |
-| `gemini-3.8-flash-medium` | Gemini 3.8 Flash (Medium) | Balanced speed and reasoning depth |
-| `gemini-3.8-flash-low` | Gemini 3.8 Flash (Low) | Lowest latency for immediate single-turn answers |
-| `gemini-3.7-flash-high` | Gemini 3.7 Flash (High) | Previous generation high-reasoning flash model |
-| `gemini-3.7-flash-medium` | Gemini 3.7 Flash (Medium) | Previous generation balanced model |
-| `gemini-3.7-flash-low` | Gemini 3.7 Flash (Low) | Previous generation low-latency model |
-| `gemini-3.6-flash-high` | Gemini 3.6 Flash (High) | Fast baseline model |
-| `gemini-3.1-pro-high` | Gemini 3.1 Pro (High) | Deep architectural reasoning and large refactoring tasks |
-| `gemini-3.1-pro-low` | Gemini 3.1 Pro (Low) | Faster Pro tier variant |
-| `claude-sonnet-4-6` | Claude Sonnet 4.6 (Thinking) | Anthropic Sonnet model via Antigravity backend |
-| `claude-opus-4-6-thinking` | Claude Opus 4.6 (Thinking) | Extended thinking model for high-complexity problems |
-| `gpt-oss-120b-medium` | GPT-OSS 120B (Medium) | Open-weights 120B model hosted on Google Cloud backend |
+| `gemini-3.8-flash-high` | Gemini 3.8 Flash (High) | **Default** — high-reasoning Google model |
+| `gemini-3.8-flash-medium` | Gemini 3.8 Flash (Medium) | Balanced speed and reasoning |
+| `gemini-3.8-flash-low` | Gemini 3.8 Flash (Low) | Lowest-latency Gemini option |
+| `claude-opus-5-5-{low,medium,high}` | Claude Opus 5.5 | Available at three effort levels |
+| `claude-sonnet-5-5-{low,medium,high}` | Claude Sonnet 5.5 | Available at three effort levels |
+| `gpt-oss-120b-medium` | GPT-OSS 120B (Medium) | Open-weights model hosted on Google Cloud |
+
+The proxy refreshes the catalog from `agy models` at startup and every five minutes, so newly enabled Antigravity models appear without a code release. The fallback list is used only if the CLI is temporarily unavailable.
 
 ---
 

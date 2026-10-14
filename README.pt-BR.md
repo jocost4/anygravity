@@ -191,20 +191,16 @@ mcp_servers:
 
 O Anygravity consulta e suporta os modelos da sua instalação local do `agy`:
 
-| Model ID | Nome | Descrição |
+| ID do modelo | Nome | Observações |
 | :--- | :--- | :--- |
-| `gemini-3.8-flash-high` | Gemini 3.8 Flash (High) | **Padrão** - Alta velocidade com esforço elevado de raciocínio |
+| `gemini-3.8-flash-high` | Gemini 3.8 Flash (High) | **Padrão** — modelo Google com raciocínio alto |
 | `gemini-3.8-flash-medium` | Gemini 3.8 Flash (Medium) | Equilíbrio entre velocidade e profundidade |
-| `gemini-3.8-flash-low` | Gemini 3.8 Flash (Low) | Menor latência para respostas rápidas |
-| `gemini-3.7-flash-high` | Gemini 3.7 Flash (High) | Geração anterior com alto raciocínio |
-| `gemini-3.7-flash-medium` | Gemini 3.7 Flash (Medium) | Geração anterior balanceada |
-| `gemini-3.7-flash-low` | Gemini 3.7 Flash (Low) | Geração anterior de baixa latência |
-| `gemini-3.6-flash-high` | Gemini 3.6 Flash (High) | Modelo base rápido |
-| `gemini-3.1-pro-high` | Gemini 3.1 Pro (High) | Tarefas profundas de arquitetura e grandes refatores |
-| `gemini-3.1-pro-low` | Gemini 3.1 Pro (Low) | Variante mais rápida do Pro |
-| `claude-sonnet-4-6` | Claude Sonnet 4.6 (Thinking) | Modelo Anthropic Sonnet via backend Antigravity |
-| `claude-opus-4-6-thinking` | Claude Opus 4.6 (Thinking) | Raciocínio estendido para problemas de alta complexidade |
-| `gpt-oss-120b-medium` | GPT-OSS 120B (Medium) | Modelo open-weights 120B hospedado no backend Google |
+| `gemini-3.8-flash-low` | Gemini 3.8 Flash (Low) | Menor latência entre os Gemini |
+| `claude-opus-5-5-{low,medium,high}` | Claude Opus 5.5 | Três níveis de esforço disponíveis |
+| `claude-sonnet-5-5-{low,medium,high}` | Claude Sonnet 5.5 | Três níveis de esforço disponíveis |
+| `gpt-oss-120b-medium` | GPT-OSS 120B (Medium) | Modelo open-weights hospedado no Google Cloud |
+
+O proxy atualiza o catálogo via `agy models` na inicialização e a cada cinco minutos; assim, modelos habilitados depois aparecem sem novo release. A lista de fallback só é usada se a CLI estiver temporariamente indisponível.
 
 ---
 

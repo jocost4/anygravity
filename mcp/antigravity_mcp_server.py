@@ -23,7 +23,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger("antigravity_mcp")
 
@@ -283,7 +283,7 @@ def create_server() -> MCPServer:
     async def agy_run_code_agent(
         task: str,
         workspace: str = "",
-        model: str = "claude-sonnet-4-6",
+        model: str = "gemini-3.8-flash-high",
         plan_only: bool = False,
         timeout_seconds: int = 600,
     ) -> str:
@@ -292,7 +292,7 @@ def create_server() -> MCPServer:
         Args:
             task: Specific coding instruction, bug fix, or refactor.
             workspace: Target repository directory.
-            model: Coding model (default 'claude-sonnet-4-6').
+            model: Coding model (default 'gemini-3.8-flash-high').
             plan_only: If True, only plans without applying file edits.
             timeout_seconds: Max execution time in seconds (default 600).
         """

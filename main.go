@@ -67,14 +67,15 @@ var (
 	agyBin       = filepath.Join(os.Getenv("HOME"), ".local/bin/agy")
 	workspaceDir = filepath.Join(os.Getenv("HOME"), ".hermes/anygravity_workspace")
 
+	// Used only while the live `agy models` catalog is unavailable. The registry
+	// refreshes from the installed CLI at startup and periodically afterwards.
 	fallbackModels = []ModelItem{
-		{ID: "gemini-3.8-flash", Name: "Gemini 3.8 Flash"},
-		{ID: "gemini-3.7-flash", Name: "Gemini 3.7 Flash"},
-		{ID: "gemini-3.6-flash", Name: "Gemini 3.6 Flash"},
-		{ID: "gemini-3.1-pro", Name: "Gemini 3.1 Pro"},
-		{ID: "claude-sonnet-4-6", Name: "Claude Sonnet 4.6"},
-		{ID: "claude-opus-4-6-thinking", Name: "Claude Opus 4.6"},
-		{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B"},
+		{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High)"},
+		{ID: "gemini-3.8-flash-medium", Name: "Gemini 3.8 Flash (Medium)"},
+		{ID: "gemini-3.8-flash-low", Name: "Gemini 3.8 Flash (Low)"},
+		{ID: "claude-opus-5-5-high", Name: "Claude Opus 5.5 (High)"},
+		{ID: "claude-sonnet-5-5-high", Name: "Claude Sonnet 5.5 (High)"},
+		{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B (Medium)"},
 	}
 
 	agySem = make(chan struct{}, getMaxConcurrency())
@@ -406,12 +407,60 @@ type ModelRegistry struct {
 	models      []ModelItem
 }
 
-var registry = &ModelRegistry{models: fallbackModels}
+var registry = &ModelRegistry{models: append([]ModelItem(nil), fallbackModels...)}
 
 func (r *ModelRegistry) GetModels() []ModelItem {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.models
+	return append([]ModelItem(nil), r.models...)
+}
+
+func parseAGYModels(output string) []ModelItem {
+	seen := make(map[string]struct{})
+	var models []ModelItem
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || !strings.Contains(fields[0], "-") {
+			continue
+		}
+		id := strings.TrimSpace(fields[0])
+		name := strings.TrimSpace(strings.TrimPrefix(line, id))
+		if id == "" || name == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		models = append(models, ModelItem{ID: id, Name: name})
+	}
+	return models
+}
+
+func (r *ModelRegistry) Refresh(ctx context.Context) error {
+	cmd := exec.CommandContext(ctx, agyBin, "models")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("query agy models: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	models := parseAGYModels(string(output))
+	if len(models) == 0 {
+		return errors.New("agy models returned no parseable models")
+	}
+
+	r.mu.Lock()
+	r.models = models
+	r.lastRefresh = time.Now()
+	r.mu.Unlock()
+	return nil
+}
+
+func refreshModelRegistry(ctx context.Context) {
+	if err := registry.Refresh(ctx); err != nil {
+		log.Printf("[Models] Live catalog refresh failed; using fallback catalog: %v", err)
+		return
+	}
+	log.Printf("[Models] Loaded %d models from agy", len(registry.GetModels()))
 }
 
 // -----------------------------------------------------------------------------
@@ -1130,107 +1179,131 @@ func handleModelInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func resolveModelAndEffort(rawModel, rawEffort string) (model string, effort string, err error) {
-	m := rawModel
+func catalogModelByID(id string) (ModelItem, bool) {
+	for _, item := range registry.GetModels() {
+		if strings.EqualFold(item.ID, id) {
+			return item, true
+		}
+	}
+	return ModelItem{}, false
+}
+
+func preferredCatalogModel(prefix string) (ModelItem, bool) {
+	var first ModelItem
+	for _, item := range registry.GetModels() {
+		if !strings.HasPrefix(strings.ToLower(item.ID), prefix) {
+			continue
+		}
+		if first.ID == "" {
+			first = item
+		}
+		if strings.HasSuffix(strings.ToLower(item.ID), "-high") {
+			return item, true
+		}
+	}
+	return first, first.ID != ""
+}
+
+func normalizeRequestedModel(raw string) string {
+	m := strings.TrimSpace(strings.ToLower(raw))
 	if strings.Contains(m, "/") {
 		parts := strings.Split(m, "/")
 		m = parts[len(parts)-1]
 	}
 	m = strings.TrimPrefix(m, "custom:")
-	m = strings.TrimPrefix(m, "openai-")
-	m = strings.TrimSpace(strings.ToLower(m))
+	return strings.TrimPrefix(m, "openai-")
+}
 
-	if m == "" || m == "auto" || m == "default" {
-		m = "gemini-3.8-flash"
+func geminiBaseAndEffort(modelID string) (base, embeddedEffort string) {
+	for _, suffix := range []string{"-medium", "-high", "-low"} {
+		if strings.HasSuffix(modelID, suffix) {
+			return strings.TrimSuffix(modelID, suffix), strings.TrimPrefix(suffix, "-")
+		}
 	}
+	return modelID, ""
+}
 
-	eff := strings.ToLower(strings.TrimSpace(rawEffort))
+func normalizeEffort(raw string) string {
+	eff := strings.ToLower(strings.TrimSpace(raw))
 	eff = strings.ReplaceAll(eff, "-", "")
 	eff = strings.ReplaceAll(eff, "_", "")
 	eff = strings.ReplaceAll(eff, " ", "")
-
-	// Extract embedded effort from model name suffix if present
-	var embeddedEffort string
-	switch {
-	case strings.HasSuffix(m, "-high"):
-		embeddedEffort = "high"
-		m = strings.TrimSuffix(m, "-high")
-	case strings.HasSuffix(m, "-medium") || strings.HasSuffix(m, "-med"):
-		embeddedEffort = "medium"
-		m = strings.TrimSuffix(m, "-medium")
-		m = strings.TrimSuffix(m, "-med")
-	case strings.HasSuffix(m, "-low"):
-		embeddedEffort = "low"
-		m = strings.TrimSuffix(m, "-low")
-	}
-
-	// Resolve base model
-	switch {
-	case strings.Contains(m, "gemini-3.8") || strings.Contains(m, "flash-3.8"):
-		model = "gemini-3.8-flash"
-	case strings.Contains(m, "gemini-3.7") || strings.Contains(m, "flash-3.7"):
-		model = "gemini-3.7-flash"
-	case strings.Contains(m, "gemini-3.6") || strings.Contains(m, "flash-3.6"):
-		model = "gemini-3.6-flash"
-	case strings.Contains(m, "gemini-3.1-pro") || strings.Contains(m, "pro-3.1") || m == "gemini-3.1":
-		model = "gemini-3.1-pro"
-	case strings.Contains(m, "opus"):
-		model = "claude-opus-4-6-thinking"
-	case strings.Contains(m, "sonnet") || strings.Contains(m, "claude"):
-		model = "claude-sonnet-4-6"
-	case strings.Contains(m, "gpt-oss") || m == "gpt-oss-120b":
-		model = "gpt-oss-120b-medium"
+	switch eff {
+	case "", "none", "default":
+		return ""
+	case "minimal":
+		return "low"
+	case "med":
+		return "medium"
+	case "low", "medium", "high":
+		return eff
 	default:
-		for _, item := range registry.GetModels() {
-			if strings.EqualFold(item.ID, m) {
-				model = item.ID
-				break
-			}
-		}
-		if model == "" {
-			return "", "", fmt.Errorf("unsupported model: %s", rawModel)
-		}
+		return ""
 	}
+}
 
-	// Determine effort based on model type
-	if strings.HasPrefix(model, "gemini-") {
-		chosenEffort := "high"
-		if eff != "" {
-			switch eff {
-			case "minimal", "low":
-				chosenEffort = "low"
-			case "medium", "med":
-				chosenEffort = "medium"
-			case "high", "xhigh", "extrahigh", "max", "ultra":
-				chosenEffort = "high"
-			}
-		} else if embeddedEffort != "" {
-			chosenEffort = embeddedEffort
-		}
+func catalogGeminiModelWithEffort(modelID, effort string) (ModelItem, bool) {
+	base, _ := geminiBaseAndEffort(modelID)
+	return catalogModelByID(base + "-" + effort)
+}
 
-		if model == "gemini-3.1-pro" {
-			if chosenEffort == "medium" {
-				chosenEffort = "high"
-			}
-		}
-		effort = chosenEffort
+func resolveModelAndEffort(rawModel, rawEffort string) (model string, effort string, err error) {
+	requested := normalizeRequestedModel(rawModel)
+	var selected ModelItem
+	var found bool
+
+	if requested == "" || requested == "auto" || requested == "default" {
+		selected, found = preferredCatalogModel("gemini-3.8-flash")
 	} else {
-		// Claude and GPT-OSS models do NOT accept --effort in agy
-		effort = ""
+		selected, found = catalogModelByID(requested)
 	}
 
-	return model, effort, nil
+	if !found {
+		switch {
+		case strings.Contains(requested, "gemini-3.8") || strings.Contains(requested, "flash-3.8"):
+			selected, found = preferredCatalogModel("gemini-3.8-flash")
+		case strings.Contains(requested, "gemini-3.7") || strings.Contains(requested, "flash-3.7"):
+			selected, found = preferredCatalogModel("gemini-3.7-flash")
+		case strings.Contains(requested, "gemini-3.6") || strings.Contains(requested, "flash-3.6"):
+			selected, found = preferredCatalogModel("gemini-3.6-flash")
+		case strings.Contains(requested, "gemini") && strings.Contains(requested, "pro"):
+			selected, found = preferredCatalogModel("gemini-3.1-pro")
+		case strings.Contains(requested, "opus"):
+			selected, found = preferredCatalogModel("claude-opus")
+		case strings.Contains(requested, "sonnet") || strings.Contains(requested, "claude"):
+			selected, found = preferredCatalogModel("claude-sonnet")
+		case strings.Contains(requested, "gpt-oss"):
+			selected, found = preferredCatalogModel("gpt-oss")
+		}
+	}
+	if !found {
+		return "", "", fmt.Errorf("unsupported model: %s", rawModel)
+	}
+
+	model = selected.ID
+	if !strings.HasPrefix(strings.ToLower(model), "gemini-") {
+		// Claude and GPT-OSS effort levels are encoded in their catalog model IDs.
+		return model, "", nil
+	}
+
+	if requestedEffort := normalizeEffort(rawEffort); requestedEffort != "" {
+		withEffort, ok := catalogGeminiModelWithEffort(model, requestedEffort)
+		if !ok {
+			return "", "", fmt.Errorf("reasoning effort %q is unavailable for model %q", rawEffort, selected.ID)
+		}
+		return withEffort.ID, "", nil
+	}
+	if _, embeddedEffort := geminiBaseAndEffort(model); embeddedEffort == "" {
+		if defaultTier, ok := catalogGeminiModelWithEffort(model, "high"); ok {
+			return defaultTier.ID, "", nil
+		}
+	}
+	return model, "", nil
 }
 
 func resolveModel(m string) (string, error) {
-	model, effort, err := resolveModelAndEffort(m, "")
-	if err != nil {
-		return "", err
-	}
-	if strings.HasPrefix(model, "gemini-") && effort != "" {
-		return model + "-" + effort, nil
-	}
-	return model, nil
+	model, _, err := resolveModelAndEffort(m, "")
+	return model, err
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -2383,6 +2456,24 @@ func main() {
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	defer sessionCancel()
 	initSessionManager(sessionCtx)
+
+	refreshCtx, refreshCancel := context.WithTimeout(sessionCtx, 15*time.Second)
+	refreshModelRegistry(refreshCtx)
+	refreshCancel()
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(sessionCtx, 15*time.Second)
+				refreshModelRegistry(ctx)
+				cancel()
+			case <-sessionCtx.Done():
+				return
+			}
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)

@@ -130,7 +130,43 @@ func TestUnstreamedSemanticMatching(t *testing.T) {
 	}
 }
 
+func TestParseAGYModels(t *testing.T) {
+	output := "Fetching available models...\n" +
+		"gemini-3.8-flash-high	Gemini 3.8 Flash (High)\n" +
+		"claude-sonnet-5-5-high	Claude Sonnet 5.5 (High)\n" +
+		"gemini-3.8-flash-high	Gemini 3.8 Flash (High)\n"
+
+	models := parseAGYModels(output)
+	if len(models) != 2 {
+		t.Fatalf("expected 2 unique models, got %#v", models)
+	}
+	if models[0].ID != "gemini-3.8-flash-high" || models[0].Name != "Gemini 3.8 Flash (High)" {
+		t.Errorf("unexpected first model: %#v", models[0])
+	}
+}
+
 func TestResolveModel(t *testing.T) {
+	registry.mu.Lock()
+	previous := registry.models
+	registry.models = []ModelItem{
+		{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High)"},
+		{ID: "gemini-3.8-flash-medium", Name: "Gemini 3.8 Flash (Medium)"},
+		{ID: "gemini-3.8-flash-low", Name: "Gemini 3.8 Flash (Low)"},
+		{ID: "claude-opus-5-5-low", Name: "Claude Opus 5.5 (Low)"},
+		{ID: "claude-opus-5-5-medium", Name: "Claude Opus 5.5 (Medium)"},
+		{ID: "claude-opus-5-5-high", Name: "Claude Opus 5.5 (High)"},
+		{ID: "claude-sonnet-5-5-low", Name: "Claude Sonnet 5.5 (Low)"},
+		{ID: "claude-sonnet-5-5-medium", Name: "Claude Sonnet 5.5 (Medium)"},
+		{ID: "claude-sonnet-5-5-high", Name: "Claude Sonnet 5.5 (High)"},
+		{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B (Medium)"},
+	}
+	registry.mu.Unlock()
+	defer func() {
+		registry.mu.Lock()
+		registry.models = previous
+		registry.mu.Unlock()
+	}()
+
 	cases := []struct {
 		input       string
 		expected    string
@@ -138,10 +174,13 @@ func TestResolveModel(t *testing.T) {
 	}{
 		{"", "gemini-3.8-flash-high", false},
 		{"auto", "gemini-3.8-flash-high", false},
-		{"default", "gemini-3.8-flash-high", false},
 		{"custom:gemini-3.8-flash-high", "gemini-3.8-flash-high", false},
-		{"claude-sonnet-4-6", "claude-sonnet-4-6", false},
-		{"claude-opus-4-6-thinking", "claude-opus-4-6-thinking", false},
+		{"claude-sonnet-5-5-low", "claude-sonnet-5-5-low", false},
+		{"claude-sonnet-5-5-medium", "claude-sonnet-5-5-medium", false},
+		{"claude-sonnet-5-5-high", "claude-sonnet-5-5-high", false},
+		{"claude-opus-5-5-low", "claude-opus-5-5-low", false},
+		{"claude-opus-5-5-medium", "claude-opus-5-5-medium", false},
+		{"claude-opus-5-5-high", "claude-opus-5-5-high", false},
 		{"gpt-oss-120b", "gpt-oss-120b-medium", false},
 		{"invalid-nonexistent-model-xyz", "", true},
 	}
@@ -444,15 +483,14 @@ func TestResolveModelAndEffort(t *testing.T) {
 		wantEffort  string
 		expectError bool
 	}{
-		{"gemini-3.8-flash-high", "", "gemini-3.8-flash", "high", false},
-		{"gemini-3.8-flash-high", "medium", "gemini-3.8-flash", "medium", false},
-		{"gemini-3.8-flash", "low", "gemini-3.8-flash", "low", false},
-		{"gemini-3.8-flash", "extra-high", "gemini-3.8-flash", "high", false},
-		{"gemini-3.8-flash", "ultra", "gemini-3.8-flash", "high", false},
-		{"gemini-3.1-pro", "medium", "gemini-3.1-pro", "high", false},
-		{"claude-sonnet-4-6", "high", "claude-sonnet-4-6", "", false},
-		{"claude-opus-4-6-thinking", "medium", "claude-opus-4-6-thinking", "", false},
-		{"auto", "", "gemini-3.8-flash", "high", false},
+		{"gemini-3.8-flash-high", "", "gemini-3.8-flash-high", "", false},
+		{"gemini-3.8-flash-high", "medium", "gemini-3.8-flash-medium", "", false},
+		{"gemini-3.8-flash-low", "", "gemini-3.8-flash-low", "", false},
+		{"gemini-3.8-flash", "low", "gemini-3.8-flash-low", "", false},
+		{"gemini-3.8-flash", "minimal", "gemini-3.8-flash-low", "", false},
+		{"claude-sonnet-5-5-high", "high", "claude-sonnet-5-5-high", "", false},
+		{"claude-opus-5-5-high", "medium", "claude-opus-5-5-high", "", false},
+		{"auto", "", "gemini-3.8-flash-high", "", false},
 		{"nonexistent-xyz", "", "", "", true},
 	}
 
@@ -472,4 +510,3 @@ func TestResolveModelAndEffort(t *testing.T) {
 		}
 	}
 }
-
