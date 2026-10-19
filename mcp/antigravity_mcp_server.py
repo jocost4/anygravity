@@ -648,6 +648,61 @@ def create_server() -> MCPServer:
         skills.sort(key=lambda x: x["name"])
         return json.dumps({"count": len(skills), "skills": skills}, ensure_ascii=False, indent=2)
 
+    @server.tool()
+    async def antigravity_list_subagents(limit: int = 15) -> str:
+        """List active and recent subagent delegations and background tasks with goals and execution status."""
+        deleg_dir = Path.home() / ".hermes" / "cache" / "delegation" / "live"
+        results = []
+        if deleg_dir.exists():
+            for d in deleg_dir.iterdir():
+                if d.is_dir() and d.name.startswith("deleg_"):
+                    manifest_file = d / "manifest.json"
+                    if manifest_file.exists():
+                        try:
+                            with open(manifest_file, "r", encoding="utf-8") as f:
+                                data = json.load(f)
+                            is_running = not bool(data.get("completed"))
+                            data["status"] = "running" if is_running else "completed"
+                            results.append(data)
+                        except Exception:
+                            continue
+        results.sort(key=lambda x: x.get("started", ""), reverse=True)
+        return json.dumps({
+            "count": len(results[:limit]),
+            "subagents": results[:limit],
+        }, ensure_ascii=False, indent=2)
+
+    @server.tool()
+    async def antigravity_subagent_log(delegation_id: str, task_index: int = 0, tail_lines: int = 50) -> str:
+        """Read live or completed log output of a specific subagent delegation.
+
+        Args:
+            delegation_id: The delegation ID (e.g. 'deleg_ea7a94aa').
+            task_index: Index of the task in the delegation (default 0).
+            tail_lines: Number of trailing log lines to return (default 50).
+        """
+        clean_id = delegation_id.strip()
+        if not _is_safe_conv_id(clean_id):
+            return json.dumps({"error": "Invalid delegation_id format."})
+
+        log_path = Path.home() / ".hermes" / "cache" / "delegation" / "live" / clean_id / f"task-{task_index}.log"
+        if not log_path.exists():
+            return json.dumps({"error": f"Log file not found at '{log_path}'."})
+
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            tail = lines[-tail_lines:] if len(lines) > tail_lines else lines
+            return json.dumps({
+                "delegation_id": clean_id,
+                "task_index": task_index,
+                "total_lines": len(lines),
+                "tail_lines": len(tail),
+                "log": "".join(tail),
+            }, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return json.dumps({"error": f"Failed to read log: {str(e)}"})
+
     return server
 
 

@@ -510,3 +510,87 @@ func TestResolveModelAndEffort(t *testing.T) {
 		}
 	}
 }
+
+func TestParseToolCalls_BatchArray(t *testing.T) {
+	input := `<tool_call>
+[
+  {"name": "delegate_task", "arguments": {"tasks": [{"goal": "Check shaders"}]}},
+  {"name": "read_file", "arguments": {"path": "/tmp/shader.spv"}}
+]
+</tool_call>`
+
+	cleanText, toolCalls := parseToolCalls(input)
+	if len(toolCalls) != 2 {
+		t.Fatalf("expected 2 tool calls, got %d", len(toolCalls))
+	}
+	if toolCalls[0].Function.Name != "delegate_task" {
+		t.Errorf("expected delegate_task, got %s", toolCalls[0].Function.Name)
+	}
+	if toolCalls[1].Function.Name != "read_file" {
+		t.Errorf("expected read_file, got %s", toolCalls[1].Function.Name)
+	}
+	// Fallback announcement should have been generated for delegate_task since cleanText was empty
+	if !strings.Contains(cleanText, "Despachando") || !strings.Contains(cleanText, "Check shaders") {
+		t.Errorf("expected subagent announcement in cleanText, got: %s", cleanText)
+	}
+}
+
+func TestParseToolCalls_SubagentListAnnouncement(t *testing.T) {
+	input := `<tool_call>
+{"name": "delegate_task", "arguments": {"action": "list"}}
+</tool_call>`
+
+	cleanText, toolCalls := parseToolCalls(input)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(toolCalls))
+	}
+	if !strings.Contains(cleanText, "Consultando status dos subagentes ativos") {
+		t.Errorf("expected list status announcement, got: %s", cleanText)
+	}
+}
+
+func TestParseToolCalls_PreservesExplicitText(t *testing.T) {
+	input := `Iniciando subagente de auditoria BDA.
+<tool_call>
+{"name": "delegate_task", "arguments": {"tasks": [{"goal": "Audit BDA"}]}}
+</tool_call>`
+
+	cleanText, toolCalls := parseToolCalls(input)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(toolCalls))
+	}
+	if !strings.Contains(cleanText, "Iniciando subagente de auditoria BDA.") {
+		t.Errorf("expected user-facing text to be preserved, got: %s", cleanText)
+	}
+}
+
+func TestBuildToolCallMap_Resolution(t *testing.T) {
+	messages := []ChatMessage{
+		{
+			Role: "assistant",
+			Content: json.RawMessage(`"Iniciando subagente"`),
+			ToolCalls: json.RawMessage(`[
+				{"id": "call_abc123", "type": "function", "function": {"name": "delegate_task", "arguments": "{}"}}
+			]`),
+		},
+		{
+			Role: "tool",
+			ToolCallID: "call_abc123",
+			Content: json.RawMessage(`"{\"status\": \"dispatched\", \"count\": 1}"`),
+		},
+	}
+
+	toolMap := buildToolCallMap(messages)
+	if toolMap["call_abc123"] != "delegate_task" {
+		t.Errorf("expected delegate_task, got %s", toolMap["call_abc123"])
+	}
+
+	formatted := formatConversation(messages, "")
+	if !strings.Contains(formatted, "[Tool Result for 'delegate_task']:") {
+		t.Errorf("expected [Tool Result for 'delegate_task']:, got:\n%s", formatted)
+	}
+	if !strings.Contains(formatted, "Assistant: Iniciando subagente") {
+		t.Errorf("expected Assistant content preserved, got:\n%s", formatted)
+	}
+}
+

@@ -115,10 +115,18 @@ func initWorkspace() {
 	geminiContent := `# ANYGRAVITY COMPLETION ENGINE
 You are acting as the backend AI completion model for an external AI Agent.
 You MUST NOT execute any local system tools or commands directly.
-When a tool is needed, respond ONLY with:
+When a tool is needed, output:
 <tool_call>
 {"name": "tool_name", "arguments": {...}}
 </tool_call>
+
+## Subagents & Delegation Protocol
+- When dispatching or spawning subagents (such as using 'delegate_task' with 'tasks' or 'goal', or 'agy_run_*'):
+  ALWAYS provide a concise user-facing explanation BEFORE the <tool_call> tag, stating that subagent(s) are being created, what their specific goal is, and that they will run in the background.
+- When the user asks about subagents, active tasks, or background operations (e.g. "como está o subagente?", "tem subagente?", "qual o status?"):
+  Use 'delegate_task' with {"action": "list"} to query active subagents, and clearly report their status, IDs, and goals to the user.
+- When subagents finish and results return (e.g. [ASYNC DELEGATION BATCH COMPLETE] or [Tool Result for 'delegate_task']):
+  Report and synthesize the subagent findings clearly for the user.
 `
 	_ = os.WriteFile(geminiMd, []byte(geminiContent), 0644)
 
@@ -520,13 +528,47 @@ func formatToolsPrompt(tools []ToolItem) string {
 [CRITICAL INSTRUCTIONS FOR AI AGENT COMPLETION]
 You are acting as the backend AI completion model for an external AI Agent.
 - You DO NOT have permission to use or execute any local system tools directly.
-- When an action or information retrieval is genuinely needed, choose from [AVAILABLE TOOLS] and respond ONLY with:
+- When an action or information retrieval is genuinely needed, choose from [AVAILABLE TOOLS] and respond with:
 <tool_call>
 {"name": "tool_name", "arguments": {"param": "value"}}
 </tool_call>
-- Do NOT output commentary or conversational filler before or after the <tool_call> tag when calling a tool.
+- SUBAGENT DELEGATION: When spawning or delegating tasks to subagents (e.g. 'delegate_task' with 'tasks' or 'goal'):
+  ALWAYS provide a concise user-facing message explaining that subagent(s) are being created and stating their specific goal.
+- SUBAGENT STATUS: When the user asks about subagents or background tasks (e.g. "como está o subagente?", "tem subagente?", "status"):
+  If you have 'delegate_task', call it with {"action": "list"} to query running subagents, and clearly report active subagents, their IDs, and goals to the user.
+- SUBAGENT RESULTS: When subagent results return (e.g. [ASYNC DELEGATION BATCH COMPLETE] or [Tool Result for 'delegate_task']):
+  Report and synthesize their findings clearly to the user.
 - IMPORTANT COMPLETION RULE: Once the tool output provides the necessary data or the requested action has been performed, DO NOT call any more tools. Respond directly to the user in normal, helpful text with your final answer, confirmation, or summary.
 `, string(b))
+}
+
+func buildToolCallMap(messages []ChatMessage) map[string]string {
+	m := make(map[string]string)
+	for _, msg := range messages {
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 && string(msg.ToolCalls) != "null" {
+			var tcList []struct {
+				ID       string `json:"id"`
+				CallID   string `json:"call_id"`
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
+			}
+			if err := json.Unmarshal(msg.ToolCalls, &tcList); err == nil {
+				for _, tc := range tcList {
+					name := strings.TrimSpace(tc.Function.Name)
+					if name != "" {
+						if tc.ID != "" {
+							m[tc.ID] = name
+						}
+						if tc.CallID != "" {
+							m[tc.CallID] = name
+						}
+					}
+				}
+			}
+		}
+	}
+	return m
 }
 
 func formatConversation(messages []ChatMessage, toolsPrompt string) string {
@@ -536,6 +578,7 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 		sb.WriteString("\n\n")
 	}
 
+	toolCallMap := buildToolCallMap(messages)
 	totalMsgs := len(messages)
 	for i, msg := range messages {
 		c := msg.ContentString()
@@ -545,6 +588,9 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 		case "user":
 			sb.WriteString("User: " + c + "\n\n")
 		case "assistant":
+			if c != "" {
+				sb.WriteString("Assistant: " + c + "\n\n")
+			}
 			if len(msg.ToolCalls) > 0 && string(msg.ToolCalls) != "null" {
 				var tcList []struct {
 					Function struct {
@@ -562,11 +608,14 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 					}
 					sb.WriteString(fmt.Sprintf("<tool_call>\n{\"name\": \"%s\", \"arguments\": %s}\n</tool_call>\n\n", tc.Function.Name, argStr))
 				}
-			} else if c != "" {
-				sb.WriteString("Assistant: " + c + "\n\n")
 			}
 		case "tool":
 			toolName := msg.Name
+			if (toolName == "" || toolName == "tool") && msg.ToolCallID != "" {
+				if resolved, ok := toolCallMap[msg.ToolCallID]; ok && resolved != "" {
+					toolName = resolved
+				}
+			}
 			if toolName == "" {
 				toolName = "tool"
 			}
@@ -582,8 +631,10 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 	if toolsPrompt != "" {
 		sb.WriteString("[CRITICAL REMINDER]\n")
 		sb.WriteString("You are the completion engine for the AI Agent. Do NOT invoke local tools directly.\n")
-		sb.WriteString("- If an action/tool call is genuinely needed, respond ONLY with:\n")
+		sb.WriteString("- If an action/tool call is genuinely needed, choose from [AVAILABLE TOOLS] and respond with:\n")
 		sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n")
+		sb.WriteString("- When dispatching subagents (e.g. 'delegate_task'), inform the user before <tool_call> of the subagent's goal.\n")
+		sb.WriteString("- If asked about subagents or background tasks, invoke 'delegate_task' with {\"action\": \"list\"} and report active subagents.\n")
 		sb.WriteString("- If the user request is satisfied or no further tool is needed, DO NOT call tools. Respond directly in normal text with your final response.\n\n")
 	}
 
@@ -593,6 +644,7 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 
 func formatDeltaPrompt(messages []ChatMessage, startIndex int) string {
 	var sb strings.Builder
+	toolCallMap := buildToolCallMap(messages)
 
 	for i := startIndex; i < len(messages); i++ {
 		msg := messages[i]
@@ -608,6 +660,11 @@ func formatDeltaPrompt(messages []ChatMessage, startIndex int) string {
 		switch msg.Role {
 		case "tool":
 			toolName := msg.Name
+			if (toolName == "" || toolName == "tool") && msg.ToolCallID != "" {
+				if resolved, ok := toolCallMap[msg.ToolCallID]; ok && resolved != "" {
+					toolName = resolved
+				}
+			}
 			if toolName == "" {
 				toolName = "tool"
 			}
@@ -620,6 +677,9 @@ func formatDeltaPrompt(messages []ChatMessage, startIndex int) string {
 			sb.WriteString("User: " + c + "\n\n")
 
 		case "assistant":
+			if c != "" {
+				sb.WriteString("Assistant: " + c + "\n\n")
+			}
 			if len(msg.ToolCalls) > 0 && string(msg.ToolCalls) != "null" {
 				var tcList []struct {
 					Function struct {
@@ -637,16 +697,16 @@ func formatDeltaPrompt(messages []ChatMessage, startIndex int) string {
 					}
 					sb.WriteString(fmt.Sprintf("<tool_call>\n{\"name\": \"%s\", \"arguments\": %s}\n</tool_call>\n\n", tc.Function.Name, argStr))
 				}
-			} else if c != "" {
-				sb.WriteString("Assistant: " + c + "\n\n")
 			}
 		}
 	}
 
 	sb.WriteString("[CRITICAL REMINDER]\n")
 	sb.WriteString("You are the completion engine for the AI Agent. Do NOT invoke local tools directly.\n")
-	sb.WriteString("- If an action/tool call is genuinely needed, respond ONLY with:\n")
+	sb.WriteString("- If an action/tool call is genuinely needed, choose from [AVAILABLE TOOLS] and respond with:\n")
 	sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n")
+	sb.WriteString("- When dispatching subagents (e.g. 'delegate_task'), inform the user before <tool_call> of the subagent's goal.\n")
+	sb.WriteString("- If asked about subagent status, invoke 'delegate_task' with {\"action\": \"list\"} and report active subagents.\n")
 	sb.WriteString("- If the previous tool result is sufficient or the task is finished, DO NOT call more tools. Respond directly to the user in normal text with your final response.\n\n")
 	sb.WriteString("Assistant:")
 
@@ -781,6 +841,230 @@ func sanitizeJSON(raw string) string {
 	return sb.String()
 }
 
+func parseToolCallJSON(raw string) []ParsedToolCall {
+	var result []ParsedToolCall
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	// 1. Try single object
+	var single struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+		Calls     []struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		} `json:"calls"`
+		ToolCalls []struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		} `json:"tool_calls"`
+	}
+
+	err := json.Unmarshal([]byte(raw), &single)
+	if err != nil {
+		sanitized := sanitizeJSON(raw)
+		_ = json.Unmarshal([]byte(sanitized), &single)
+	}
+
+	if single.Name != "" && single.Name != "tool_call" {
+		tc := ParsedToolCall{
+			ID:   nextToolCallID(),
+			Type: "function",
+		}
+		tc.Function.Name = strings.TrimSpace(single.Name)
+		tc.Function.Arguments = normalizeArgs(single.Arguments)
+		result = append(result, tc)
+		return result
+	}
+
+	// 2. If wrapped in calls or tool_calls
+	if len(single.Calls) > 0 {
+		for _, c := range single.Calls {
+			if c.Name != "" {
+				tc := ParsedToolCall{
+					ID:   nextToolCallID(),
+					Type: "function",
+				}
+				tc.Function.Name = strings.TrimSpace(c.Name)
+				tc.Function.Arguments = normalizeArgs(c.Arguments)
+				result = append(result, tc)
+			}
+		}
+		if len(result) > 0 {
+			return result
+		}
+	}
+	if len(single.ToolCalls) > 0 {
+		for _, c := range single.ToolCalls {
+			if c.Name != "" {
+				tc := ParsedToolCall{
+					ID:   nextToolCallID(),
+					Type: "function",
+				}
+				tc.Function.Name = strings.TrimSpace(c.Name)
+				tc.Function.Arguments = normalizeArgs(c.Arguments)
+				result = append(result, tc)
+			}
+		}
+		if len(result) > 0 {
+			return result
+		}
+	}
+
+	// 3. If single.Name == "tool_call" and arguments has nested "calls"
+	if single.Name == "tool_call" && len(single.Arguments) > 0 {
+		var sub struct {
+			Calls []struct {
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
+			} `json:"calls"`
+		}
+		if err := json.Unmarshal(single.Arguments, &sub); err == nil && len(sub.Calls) > 0 {
+			for _, c := range sub.Calls {
+				if c.Name != "" {
+					tc := ParsedToolCall{
+						ID:   nextToolCallID(),
+						Type: "function",
+					}
+					tc.Function.Name = strings.TrimSpace(c.Name)
+					tc.Function.Arguments = normalizeArgs(c.Arguments)
+					result = append(result, tc)
+				}
+			}
+			if len(result) > 0 {
+				return result
+			}
+		}
+		// If cannot unwrap, keep single tool_call
+		tc := ParsedToolCall{
+			ID:   nextToolCallID(),
+			Type: "function",
+		}
+		tc.Function.Name = "tool_call"
+		tc.Function.Arguments = normalizeArgs(single.Arguments)
+		result = append(result, tc)
+		return result
+	}
+
+	// 4. Try array of objects: [{"name": ...}, ...]
+	var arr []struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	errArr := json.Unmarshal([]byte(raw), &arr)
+	if errArr != nil {
+		sanitized := sanitizeJSON(raw)
+		_ = json.Unmarshal([]byte(sanitized), &arr)
+	}
+	for _, item := range arr {
+		if item.Name != "" {
+			tc := ParsedToolCall{
+				ID:   nextToolCallID(),
+				Type: "function",
+			}
+			tc.Function.Name = strings.TrimSpace(item.Name)
+			tc.Function.Arguments = normalizeArgs(item.Arguments)
+			result = append(result, tc)
+		}
+	}
+
+	return result
+}
+
+func formatSubagentAnnouncement(toolCalls []ParsedToolCall) string {
+	for _, tc := range toolCalls {
+		switch tc.Function.Name {
+		case "delegate_task":
+			var args struct {
+				Action string `json:"action"`
+				Goal   string `json:"goal"`
+				Tasks  []struct {
+					Goal string `json:"goal"`
+				} `json:"tasks"`
+			}
+			_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+			action := strings.ToLower(strings.TrimSpace(args.Action))
+			if action == "list" {
+				return "Consultando status dos subagentes ativos..."
+			} else if action == "stop" {
+				return "Encerrando subagente..."
+			} else if action == "steer" {
+				return "Enviando novas instruções para o subagente..."
+			}
+			var goals []string
+			if len(args.Tasks) > 0 {
+				for _, t := range args.Tasks {
+					if t.Goal != "" {
+						g := strings.TrimSpace(t.Goal)
+						if len(g) > 90 {
+							g = g[:87] + "..."
+						}
+						goals = append(goals, g)
+					}
+				}
+			} else if args.Goal != "" {
+				g := strings.TrimSpace(args.Goal)
+				if len(g) > 90 {
+					g = g[:87] + "..."
+				}
+				goals = append(goals, g)
+			}
+			if len(goals) > 0 {
+				return fmt.Sprintf("Despachando %d subagente(s) em segundo plano:\n- %s", len(goals), strings.Join(goals, "\n- "))
+			}
+			return "Despachando subagente em segundo plano..."
+
+		case "mcp__antigravity__antigravity_run", "antigravity_run":
+			var args struct {
+				Prompt string `json:"prompt"`
+			}
+			_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+			p := strings.TrimSpace(args.Prompt)
+			if len(p) > 90 {
+				p = p[:87] + "..."
+			}
+			if p != "" {
+				return fmt.Sprintf("Iniciando subagente Antigravity: %s", p)
+			}
+			return "Iniciando subagente Antigravity em segundo plano..."
+
+		case "mcp__antigravity__agy_run_code_agent", "agy_run_code_agent":
+			var args struct {
+				Task string `json:"task"`
+			}
+			_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+			t := strings.TrimSpace(args.Task)
+			if len(t) > 90 {
+				t = t[:87] + "..."
+			}
+			if t != "" {
+				return fmt.Sprintf("Iniciando Code Agent Antigravity: %s", t)
+			}
+			return "Iniciando Code Agent Antigravity..."
+
+		case "mcp__antigravity__agy_run_research_agent", "agy_run_research_agent":
+			var args struct {
+				Query string `json:"query"`
+			}
+			_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+			q := strings.TrimSpace(args.Query)
+			if len(q) > 90 {
+				q = q[:87] + "..."
+			}
+			if q != "" {
+				return fmt.Sprintf("Iniciando Research Agent Antigravity: %s", q)
+			}
+			return "Iniciando Research Agent Antigravity..."
+
+		case "mcp__antigravity__antigravity_list_subagents", "antigravity_list_subagents":
+			return "Consultando histórico e status de subagentes Antigravity..."
+		}
+	}
+	return ""
+}
+
 func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) {
 	cleaned := text
 
@@ -792,22 +1076,9 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 		raw = strings.TrimSuffix(raw, "```")
 		raw = strings.TrimSpace(raw)
 
-		var single struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		}
-		if err := json.Unmarshal([]byte(raw), &single); err != nil {
-			sanitized := sanitizeJSON(raw)
-			_ = json.Unmarshal([]byte(sanitized), &single)
-		}
-		if single.Name != "" {
-			tc := ParsedToolCall{
-				Index: len(toolCalls),
-				ID:    nextToolCallID(),
-				Type:  "function",
-			}
-			tc.Function.Name = strings.TrimSpace(single.Name)
-			tc.Function.Arguments = normalizeArgs(single.Arguments)
+		parsed := parseToolCallJSON(raw)
+		for _, tc := range parsed {
+			tc.Index = len(toolCalls)
 			toolCalls = append(toolCalls, tc)
 		}
 	}
@@ -816,22 +1087,9 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 	bMatches := blockRegex.FindAllStringSubmatch(cleaned, -1)
 	for _, m := range bMatches {
 		raw := strings.TrimSpace(m[1])
-		var single struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		}
-		if err := json.Unmarshal([]byte(raw), &single); err != nil {
-			sanitized := sanitizeJSON(raw)
-			_ = json.Unmarshal([]byte(sanitized), &single)
-		}
-		if single.Name != "" {
-			tc := ParsedToolCall{
-				Index: len(toolCalls),
-				ID:    nextToolCallID(),
-				Type:  "function",
-			}
-			tc.Function.Name = strings.TrimSpace(single.Name)
-			tc.Function.Arguments = normalizeArgs(single.Arguments)
+		parsed := parseToolCallJSON(raw)
+		for _, tc := range parsed {
+			tc.Index = len(toolCalls)
 			toolCalls = append(toolCalls, tc)
 		}
 	}
@@ -847,22 +1105,9 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 		if endOffset == -1 {
 			break
 		}
-		var single struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		}
-		if err := json.Unmarshal([]byte(jsonStr), &single); err != nil {
-			sanitized := sanitizeJSON(jsonStr)
-			_ = json.Unmarshal([]byte(sanitized), &single)
-		}
-		if single.Name != "" {
-			tc := ParsedToolCall{
-				Index: len(toolCalls),
-				ID:    nextToolCallID(),
-				Type:  "function",
-			}
-			tc.Function.Name = strings.TrimSpace(single.Name)
-			tc.Function.Arguments = normalizeArgs(single.Arguments)
+		parsed := parseToolCallJSON(jsonStr)
+		for _, tc := range parsed {
+			tc.Index = len(toolCalls)
 			toolCalls = append(toolCalls, tc)
 		}
 		cleaned = cleaned[:loc[0]] + cleaned[braceIdx+endOffset:]
@@ -884,8 +1129,8 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 	cleaned = internalRegex.ReplaceAllString(cleaned, "")
 
 	cleanText = strings.TrimSpace(cleaned)
-	// When calling tools, any preamble monologue is model thinking/reasoning,
-	// never user-facing chat text. Clear cleanText so it does not leak to chat.
+	cleanText = strings.Trim(cleanText, "` \t\r\n")
+
 	if len(toolCalls) > 1 {
 		var uniqueCalls []ParsedToolCall
 		seen := make(map[string]bool)
@@ -900,11 +1145,16 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 		toolCalls = uniqueCalls
 	}
 
-	if len(toolCalls) > 0 {
-		cleanText = ""
-	} else if cleanText == "" && strings.TrimSpace(text) != "" {
-		// If no tool call was successfully parsed, don't drop the model's text into an empty response!
+	// If no tool call was successfully parsed, don't drop the model's text into an empty response!
+	if len(toolCalls) == 0 && cleanText == "" && strings.TrimSpace(text) != "" {
 		cleanText = strings.TrimSpace(text)
+	}
+
+	// If tools were called and cleanText is empty, synthesize an informative notification for subagent operations
+	if len(toolCalls) > 0 && cleanText == "" {
+		if ann := formatSubagentAnnouncement(toolCalls); ann != "" {
+			cleanText = ann
+		}
 	}
 
 	return cleanText, toolCalls
