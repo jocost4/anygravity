@@ -127,6 +127,11 @@ When a tool is needed, output:
   Use 'delegate_task' with {"action": "list"} to query active subagents, and clearly report their status, IDs, and goals to the user.
 - When subagents finish and results return (e.g. [ASYNC DELEGATION BATCH COMPLETE] or [Tool Result for 'delegate_task']):
   Report and synthesize the subagent findings clearly for the user.
+
+## Tool Execution Protocol
+- When invoking tools, output <tool_call>...</tool_call> and STOP immediately.
+- NEVER simulate tool execution or invent fake results (do NOT write '[Tool Result for ...]').
+- Wait for the external agent to execute the tool and return the real tool result before providing explanations or deliverables.
 `
 	_ = os.WriteFile(geminiMd, []byte(geminiContent), 0644)
 
@@ -635,6 +640,8 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 		sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n")
 		sb.WriteString("- When dispatching subagents (e.g. 'delegate_task'), inform the user before <tool_call> of the subagent's goal.\n")
 		sb.WriteString("- If asked about subagents or background tasks, invoke 'delegate_task' with {\"action\": \"list\"} and report active subagents.\n")
+		sb.WriteString("- NEVER simulate tool execution or fake tool results (do NOT write '[Tool Result for ...]').\n")
+		sb.WriteString("- When calling a tool, STOP immediately after </tool_call>. Wait for the real tool result before providing explanations or final deliverables.\n")
 		sb.WriteString("- If the user request is satisfied or no further tool is needed, DO NOT call tools. Respond directly in normal text with your final response.\n\n")
 	}
 
@@ -707,6 +714,8 @@ func formatDeltaPrompt(messages []ChatMessage, startIndex int) string {
 	sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n")
 	sb.WriteString("- When dispatching subagents (e.g. 'delegate_task'), inform the user before <tool_call> of the subagent's goal.\n")
 	sb.WriteString("- If asked about subagent status, invoke 'delegate_task' with {\"action\": \"list\"} and report active subagents.\n")
+	sb.WriteString("- NEVER simulate tool execution or fake tool results (do NOT write '[Tool Result for ...]').\n")
+	sb.WriteString("- When calling a tool, STOP immediately after </tool_call>. Wait for the real tool result before providing explanations or final deliverables.\n")
 	sb.WriteString("- If the previous tool result is sufficient or the task is finished, DO NOT call more tools. Respond directly to the user in normal text with your final response.\n\n")
 	sb.WriteString("Assistant:")
 
@@ -1145,15 +1154,53 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 		toolCalls = uniqueCalls
 	}
 
-	// If no tool call was successfully parsed, don't drop the model's text into an empty response!
-	if len(toolCalls) == 0 && cleanText == "" && strings.TrimSpace(text) != "" {
-		cleanText = strings.TrimSpace(text)
-	}
+	if len(toolCalls) > 0 {
+		// When tools are called, ONLY text that appeared BEFORE the first tool marker
+		// is a legitimate user-facing preamble (e.g. subagent dispatch announcement).
+		// Any text after or between tool calls is a hallucinated tool execution
+		// (e.g. fake "[Tool Result for ...]") or a premature final response that
+		// would cause duplicated responses once the real tool completes.
+		firstMarkerIdx := -1
+		markerPatterns := []string{"<tool_call>", "<function_call>", "```tool_call", "tool_call:", "function_call:", "call:default_api:"}
+		for _, pat := range markerPatterns {
+			if idx := strings.Index(text, pat); idx != -1 {
+				if firstMarkerIdx == -1 || idx < firstMarkerIdx {
+					firstMarkerIdx = idx
+				}
+			}
+		}
 
-	// If tools were called and cleanText is empty, synthesize an informative notification for subagent operations
-	if len(toolCalls) > 0 && cleanText == "" {
-		if ann := formatSubagentAnnouncement(toolCalls); ann != "" {
-			cleanText = ann
+		if firstMarkerIdx != -1 {
+			preamble := strings.TrimSpace(text[:firstMarkerIdx])
+			preamble = thinkRegex.ReplaceAllString(preamble, "")
+			preamble = strings.Trim(preamble, "` \t\r\n")
+			// Discard if it looks like a simulated tool result or internal artifact
+			if strings.Contains(preamble, "[Tool Result") || strings.Contains(preamble, "Tool Result for") {
+				preamble = ""
+			}
+			cleanText = preamble
+		} else {
+			cleanText = ""
+		}
+
+		// If cleanText is empty, synthesize an informative announcement for subagent operations
+		if cleanText == "" {
+			if ann := formatSubagentAnnouncement(toolCalls); ann != "" {
+				cleanText = ann
+			}
+		}
+	} else {
+		cleanText = strings.TrimSpace(cleaned)
+		cleanText = strings.Trim(cleanText, "` \t\r\n")
+
+		// Strip any hallucinated tool result blocks from normal response text
+		if strings.Contains(cleanText, "[Tool Result") || strings.Contains(cleanText, "Tool Result for") {
+			toolResultRegex := regexp.MustCompile(`(?s)\[Tool Result for '[^']+'\]:.*?(?:\n\n|$)`)
+			cleanText = strings.TrimSpace(toolResultRegex.ReplaceAllString(cleanText, ""))
+		}
+
+		if cleanText == "" && strings.TrimSpace(text) != "" {
+			cleanText = strings.TrimSpace(text)
 		}
 	}
 

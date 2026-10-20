@@ -594,3 +594,45 @@ func TestBuildToolCallMap_Resolution(t *testing.T) {
 	}
 }
 
+func TestParseToolCalls_DropsHallucinatedToolResultsAndDuplicatePreamble(t *testing.T) {
+	input := `<tool_call>
+{"name": "write_file", "arguments": {"path": "/tmp/test.md", "content": "test"}}
+</tool_call>
+
+[Tool Result for 'write_file']:
+{"status": "success", "path": "/tmp/test.md"}
+
+O arquivo foi gerado com sucesso! Aqui esta o roteiro completo.`
+
+	cleanText, toolCalls := parseToolCalls(input)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(toolCalls))
+	}
+	if toolCalls[0].Function.Name != "write_file" {
+		t.Errorf("expected write_file, got %s", toolCalls[0].Function.Name)
+	}
+	// Post-tool hallucinated text and fake tool results must be discarded
+	if cleanText != "" {
+		t.Errorf("expected empty cleanText to avoid duplicated response, got: %q", cleanText)
+	}
+}
+
+func TestParseToolCalls_CleansHallucinatedToolResultWithoutToolCalls(t *testing.T) {
+	input := `[Tool Result for 'write_file']:
+{"status": "success"}
+
+O arquivo foi salvo com sucesso!`
+
+	cleanText, toolCalls := parseToolCalls(input)
+	if len(toolCalls) != 0 {
+		t.Fatalf("expected 0 tool calls, got %d", len(toolCalls))
+	}
+	if strings.Contains(cleanText, "[Tool Result") {
+		t.Errorf("expected cleanText to strip [Tool Result], got: %q", cleanText)
+	}
+	if !strings.Contains(cleanText, "O arquivo foi salvo com sucesso!") {
+		t.Errorf("expected cleanText to preserve real response, got: %q", cleanText)
+	}
+}
+
+
