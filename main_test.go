@@ -516,7 +516,12 @@ func TestResolveModelAndEffort(t *testing.T) {
 		{"gemini-3.8-flash", "low", "gemini-3.8-flash-low", "", false},
 		{"gemini-3.8-flash", "minimal", "gemini-3.8-flash-low", "", false},
 		{"claude-sonnet-5-5-high", "high", "claude-sonnet-5-5-high", "", false},
-		{"claude-opus-5-5-high", "medium", "claude-opus-5-5-high", "", false},
+		{"claude-opus-5-5-high", "medium", "claude-opus-5-5-medium", "", false},
+		{"claude-opus-5-5", "low", "claude-opus-5-5-low", "", false},
+		{"claude-opus-5-5", "", "claude-opus-5-5-high", "", false},
+		{"claude-sonnet-5-5", "medium", "claude-sonnet-5-5-medium", "", false},
+		{"gpt-oss-120b", "high", "gpt-oss-120b-medium", "", false},
+		{"gpt-oss-120b", "", "gpt-oss-120b-medium", "", false},
 		{"auto", "", "gemini-3.8-flash-high", "", false},
 		{"gemini-4-argon", "", "gemini-4-argon-high", "", false},
 		{"gemini-4-argon", "medium", "gemini-4-argon-medium", "", false},
@@ -664,5 +669,84 @@ O arquivo foi salvo com sucesso!`
 		t.Errorf("expected cleanText to preserve real response, got: %q", cleanText)
 	}
 }
+
+func TestGetBaseModels(t *testing.T) {
+	registry.mu.Lock()
+	prev := registry.models
+	registry.models = []ModelItem{
+		{ID: "gemini-4-argon-medium", Name: "Gemini 4 Argon (Medium)"},
+		{ID: "gemini-4-argon-high", Name: "Gemini 4 Argon (High)"},
+		{ID: "gemini-4-argon-low", Name: "Gemini 4 Argon (Low)"},
+		{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High)"},
+		{ID: "gemini-3.8-flash-medium", Name: "Gemini 3.8 Flash (Medium)"},
+		{ID: "gemini-3.8-flash-low", Name: "Gemini 3.8 Flash (Low)"},
+		{ID: "claude-opus-5-5-low", Name: "Claude Opus 5.5 (Low)"},
+		{ID: "claude-opus-5-5-medium", Name: "Claude Opus 5.5 (Medium)"},
+		{ID: "claude-opus-5-5-high", Name: "Claude Opus 5.5 (High)"},
+		{ID: "claude-sonnet-5-5-low", Name: "Claude Sonnet 5.5 (Low)"},
+		{ID: "claude-sonnet-5-5-medium", Name: "Claude Sonnet 5.5 (Medium)"},
+		{ID: "claude-sonnet-5-5-high", Name: "Claude Sonnet 5.5 (High)"},
+		{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B (Medium)"},
+	}
+	registry.mu.Unlock()
+	defer func() {
+		registry.mu.Lock()
+		registry.models = prev
+		registry.mu.Unlock()
+	}()
+
+	baseModels := getBaseModels()
+	if len(baseModels) != 5 {
+		t.Fatalf("expected 5 base models, got %d", len(baseModels))
+	}
+
+	expected := map[string]string{
+		"gemini-4-argon":    "Gemini 4 Argon",
+		"gemini-3.8-flash":  "Gemini 3.8 Flash",
+		"claude-opus-5-5":   "Claude Opus 5.5",
+		"claude-sonnet-5-5": "Claude Sonnet 5.5",
+		"gpt-oss-120b":      "GPT-OSS 120B",
+	}
+
+	for _, bm := range baseModels {
+		expName, ok := expected[bm.ID]
+		if !ok {
+			t.Errorf("unexpected base model ID: %q", bm.ID)
+		}
+		if bm.Name != expName {
+			t.Errorf("base model %q name = %q; want %q", bm.ID, bm.Name, expName)
+		}
+	}
+}
+
+func TestHandleModels_Collapsed(t *testing.T) {
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	rr := httptest.NewRecorder()
+	handleModels(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rr.Code)
+	}
+
+	var resp struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse /v1/models response: %v", err)
+	}
+
+	for _, item := range resp.Data {
+		for _, suffix := range []string{"-high", "-medium", "-low"} {
+			if strings.HasSuffix(item.ID, suffix) {
+				t.Errorf("model ID %q should be collapsed without suffix %q", item.ID, suffix)
+			}
+		}
+	}
+}
+
 
 

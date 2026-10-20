@@ -70,11 +70,18 @@ var (
 	// Used only while the live `agy models` catalog is unavailable. The registry
 	// refreshes from the installed CLI at startup and periodically afterwards.
 	fallbackModels = []ModelItem{
+		{ID: "gemini-4-argon-high", Name: "Gemini 4 Argon (High)"},
+		{ID: "gemini-4-argon-medium", Name: "Gemini 4 Argon (Medium)"},
+		{ID: "gemini-4-argon-low", Name: "Gemini 4 Argon (Low)"},
 		{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High)"},
 		{ID: "gemini-3.8-flash-medium", Name: "Gemini 3.8 Flash (Medium)"},
 		{ID: "gemini-3.8-flash-low", Name: "Gemini 3.8 Flash (Low)"},
 		{ID: "claude-opus-5-5-high", Name: "Claude Opus 5.5 (High)"},
+		{ID: "claude-opus-5-5-medium", Name: "Claude Opus 5.5 (Medium)"},
+		{ID: "claude-opus-5-5-low", Name: "Claude Opus 5.5 (Low)"},
 		{ID: "claude-sonnet-5-5-high", Name: "Claude Sonnet 5.5 (High)"},
+		{ID: "claude-sonnet-5-5-medium", Name: "Claude Sonnet 5.5 (Medium)"},
+		{ID: "claude-sonnet-5-5-low", Name: "Claude Sonnet 5.5 (Low)"},
 		{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B (Medium)"},
 	}
 
@@ -478,8 +485,50 @@ func refreshModelRegistry(ctx context.Context) {
 	syncHermesConfig(models)
 }
 
-func syncHermesConfig(models []ModelItem) {
+func modelBaseAndEffort(modelID string) (base, embeddedEffort string) {
+	for _, suffix := range []string{"-medium", "-high", "-low"} {
+		if strings.HasSuffix(modelID, suffix) {
+			return strings.TrimSuffix(modelID, suffix), strings.TrimPrefix(suffix, "-")
+		}
+	}
+	return modelID, ""
+}
+
+func geminiBaseAndEffort(modelID string) (base, embeddedEffort string) {
+	return modelBaseAndEffort(modelID)
+}
+
+func getBaseModels() []ModelItem {
+	models := registry.GetModels()
 	if len(models) == 0 {
+		models = fallbackModels
+	}
+	seen := make(map[string]bool)
+	var baseModels []ModelItem
+
+	for _, m := range models {
+		baseID, _ := modelBaseAndEffort(m.ID)
+		if seen[baseID] || baseID == "" {
+			continue
+		}
+		seen[baseID] = true
+
+		cleanName := m.Name
+		for _, suffix := range []string{" (High)", " (Medium)", " (Low)"} {
+			cleanName = strings.TrimSuffix(cleanName, suffix)
+		}
+
+		baseModels = append(baseModels, ModelItem{
+			ID:   baseID,
+			Name: cleanName,
+		})
+	}
+	return baseModels
+}
+
+func syncHermesConfig(models []ModelItem) {
+	baseModels := getBaseModels()
+	if len(baseModels) == 0 {
 		return
 	}
 	configPath := filepath.Join(os.Getenv("HOME"), ".hermes/config.yaml")
@@ -495,20 +544,6 @@ func syncHermesConfig(models []ModelItem) {
 		return
 	}
 
-	// Extract unique base models from current live catalog
-	seen := make(map[string]bool)
-	var baseModels []string
-	for _, m := range models {
-		base, _ := geminiBaseAndEffort(m.ID)
-		for _, eff := range []string{"-high", "-medium", "-low"} {
-			base = strings.TrimSuffix(base, eff)
-		}
-		if !seen[base] && base != "" {
-			seen[base] = true
-			baseModels = append(baseModels, base)
-		}
-	}
-
 	modelsIdx := strings.Index(content[idx:], "models:")
 	if modelsIdx == -1 {
 		return
@@ -520,7 +555,7 @@ func syncHermesConfig(models []ModelItem) {
 	var newModelsLines []string
 	newModelsLines = append(newModelsLines, "models:")
 	for _, bm := range baseModels {
-		newModelsLines = append(newModelsLines, fmt.Sprintf("      %s: {}", bm))
+		newModelsLines = append(newModelsLines, fmt.Sprintf("      %s: {}", bm.ID))
 	}
 
 	endLineIdx := -1
@@ -549,7 +584,11 @@ func syncHermesConfig(models []ModelItem) {
 
 	if updated != content {
 		if err := os.WriteFile(configPath, []byte(updated), 0644); err == nil {
-			log.Printf("[Models] Synced %d active model families into ~/.hermes/config.yaml: %v", len(baseModels), baseModels)
+			var names []string
+			for _, bm := range baseModels {
+				names = append(names, bm.ID)
+			}
+			log.Printf("[Models] Synced %d active model families into ~/.hermes/config.yaml: %v", len(baseModels), names)
 		}
 	}
 }
@@ -1505,7 +1544,7 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleModels(w http.ResponseWriter, r *http.Request) {
-	models := registry.GetModels()
+	models := getBaseModels()
 	type ModelEntry struct {
 		ID      string `json:"id"`
 		Object  string `json:"object"`
@@ -1531,6 +1570,18 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 func handleModelInfo(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/v1/models/")
 	id = strings.TrimSpace(id)
+	for _, m := range getBaseModels() {
+		if strings.EqualFold(m.ID, id) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":       m.ID,
+				"object":   "model",
+				"owned_by": "antigravity",
+				"name":     m.Name,
+			})
+			return
+		}
+	}
 	for _, m := range registry.GetModels() {
 		if strings.EqualFold(m.ID, id) {
 			w.Header().Set("Content-Type", "application/json")
@@ -1589,15 +1640,6 @@ func normalizeRequestedModel(raw string) string {
 	return strings.TrimPrefix(m, "openai-")
 }
 
-func geminiBaseAndEffort(modelID string) (base, embeddedEffort string) {
-	for _, suffix := range []string{"-medium", "-high", "-low"} {
-		if strings.HasSuffix(modelID, suffix) {
-			return strings.TrimSuffix(modelID, suffix), strings.TrimPrefix(suffix, "-")
-		}
-	}
-	return modelID, ""
-}
-
 func normalizeEffort(raw string) string {
 	eff := strings.ToLower(strings.TrimSpace(raw))
 	eff = strings.ReplaceAll(eff, "-", "")
@@ -1617,9 +1659,13 @@ func normalizeEffort(raw string) string {
 	}
 }
 
-func catalogGeminiModelWithEffort(modelID, effort string) (ModelItem, bool) {
-	base, _ := geminiBaseAndEffort(modelID)
+func catalogModelWithEffort(modelID, effort string) (ModelItem, bool) {
+	base, _ := modelBaseAndEffort(modelID)
 	return catalogModelByID(base + "-" + effort)
+}
+
+func catalogGeminiModelWithEffort(modelID, effort string) (ModelItem, bool) {
+	return catalogModelWithEffort(modelID, effort)
 }
 
 func resolveModelAndEffort(rawModel, rawEffort string) (model string, effort string, err error) {
@@ -1693,20 +1739,17 @@ func resolveModelAndEffort(rawModel, rawEffort string) (model string, effort str
 	}
 
 	model = selected.ID
-	if !strings.HasPrefix(strings.ToLower(model), "gemini-") {
-		// Claude and GPT-OSS effort levels are encoded in their catalog model IDs.
-		return model, "", nil
-	}
-
 	if requestedEffort := normalizeEffort(rawEffort); requestedEffort != "" {
-		withEffort, ok := catalogGeminiModelWithEffort(model, requestedEffort)
-		if !ok {
-			return "", "", fmt.Errorf("reasoning effort %q is unavailable for model %q", rawEffort, selected.ID)
+		withEffort, ok := catalogModelWithEffort(model, requestedEffort)
+		if ok {
+			return withEffort.ID, "", nil
 		}
-		return withEffort.ID, "", nil
+		// If requested effort tier isn't available in catalog (e.g. gpt-oss-120b only has medium),
+		// fall back to the selected variant rather than failing.
+		return selected.ID, "", nil
 	}
-	if _, embeddedEffort := geminiBaseAndEffort(model); embeddedEffort == "" {
-		if defaultTier, ok := catalogGeminiModelWithEffort(model, "high"); ok {
+	if _, embeddedEffort := modelBaseAndEffort(model); embeddedEffort == "" {
+		if defaultTier, ok := catalogModelWithEffort(model, "high"); ok {
 			return defaultTier.ID, "", nil
 		}
 	}
@@ -2864,7 +2907,7 @@ func handleOllamaShow(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleOllamaTags(w http.ResponseWriter, r *http.Request) {
-	models := registry.GetModels()
+	models := getBaseModels()
 	var list []map[string]interface{}
 	for _, m := range models {
 		list = append(list, map[string]interface{}{
