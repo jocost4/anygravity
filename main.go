@@ -473,7 +473,85 @@ func refreshModelRegistry(ctx context.Context) {
 		log.Printf("[Models] Live catalog refresh failed; using fallback catalog: %v", err)
 		return
 	}
-	log.Printf("[Models] Loaded %d models from agy", len(registry.GetModels()))
+	models := registry.GetModels()
+	log.Printf("[Models] Loaded %d models from agy", len(models))
+	syncHermesConfig(models)
+}
+
+func syncHermesConfig(models []ModelItem) {
+	if len(models) == 0 {
+		return
+	}
+	configPath := filepath.Join(os.Getenv("HOME"), ".hermes/config.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+
+	content := string(data)
+	const marker = "name: Anygravity (localhost:20130)"
+	idx := strings.Index(content, marker)
+	if idx == -1 {
+		return
+	}
+
+	// Extract unique base models from current live catalog
+	seen := make(map[string]bool)
+	var baseModels []string
+	for _, m := range models {
+		base, _ := geminiBaseAndEffort(m.ID)
+		for _, eff := range []string{"-high", "-medium", "-low"} {
+			base = strings.TrimSuffix(base, eff)
+		}
+		if !seen[base] && base != "" {
+			seen[base] = true
+			baseModels = append(baseModels, base)
+		}
+	}
+
+	modelsIdx := strings.Index(content[idx:], "models:")
+	if modelsIdx == -1 {
+		return
+	}
+	absModelsIdx := idx + modelsIdx
+
+	rest := content[absModelsIdx:]
+	lines := strings.Split(rest, "\n")
+	var newModelsLines []string
+	newModelsLines = append(newModelsLines, "models:")
+	for _, bm := range baseModels {
+		newModelsLines = append(newModelsLines, fmt.Sprintf("      %s: {}", bm))
+	}
+
+	endLineIdx := -1
+	for i := 1; i < len(lines); i++ {
+		line := lines[i]
+		if strings.HasPrefix(line, "  - ") || (len(line) > 0 && line[0] != ' ' && line[0] != '#') {
+			endLineIdx = i
+			break
+		}
+	}
+
+	if endLineIdx == -1 {
+		endLineIdx = len(lines)
+	}
+
+	before := content[:absModelsIdx]
+	after := strings.Join(lines[endLineIdx:], "\n")
+	newBlock := strings.Join(newModelsLines, "\n")
+
+	var updated string
+	if after != "" {
+		updated = before + newBlock + "\n" + after
+	} else {
+		updated = before + newBlock + "\n"
+	}
+
+	if updated != content {
+		if err := os.WriteFile(configPath, []byte(updated), 0644); err == nil {
+			log.Printf("[Models] Synced %d active model families into ~/.hermes/config.yaml: %v", len(baseModels), baseModels)
+		}
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -1549,41 +1627,67 @@ func resolveModelAndEffort(rawModel, rawEffort string) (model string, effort str
 	var selected ModelItem
 	var found bool
 
+	catalog := registry.GetModels()
+	if len(catalog) == 0 {
+		catalog = fallbackModels
+	}
+
 	if requested == "" || requested == "auto" || requested == "default" {
 		selected, found = preferredCatalogModel("gemini-3.8-flash")
+		if !found {
+			selected, found = preferredCatalogModel("gemini-4-argon")
+		}
 	} else {
 		selected, found = catalogModelByID(requested)
 	}
 
+	// 1. Dynamic prefix matching (e.g. "gemini-4-argon" -> "gemini-4-argon-high")
+	if !found {
+		selected, found = preferredCatalogModel(requested)
+	}
+
+	// 2. Dynamic substring / keyword matching across live catalog
+	if !found {
+		for _, item := range catalog {
+			idLower := strings.ToLower(item.ID)
+			base, _ := geminiBaseAndEffort(idLower)
+			for _, eff := range []string{"-high", "-medium", "-low"} {
+				base = strings.TrimSuffix(base, eff)
+			}
+			if strings.Contains(idLower, requested) || (base != "" && strings.Contains(requested, base)) {
+				selected, found = preferredCatalogModel(base)
+				if !found {
+					selected, found = item, true
+				}
+				break
+			}
+		}
+	}
+
+	// 3. Dynamic family / fallback matching for retired or renamed models
 	if !found {
 		switch {
 		case strings.Contains(requested, "argon") || strings.Contains(requested, "gemini-4"):
 			selected, found = preferredCatalogModel("gemini-4-argon")
-		case strings.Contains(requested, "gemini-3.8") || strings.Contains(requested, "flash-3.8"):
+		case strings.Contains(requested, "flash") || strings.Contains(requested, "gemini-3"):
 			selected, found = preferredCatalogModel("gemini-3.8-flash")
-		case strings.Contains(requested, "gemini-3.7") || strings.Contains(requested, "flash-3.7"):
-			selected, found = preferredCatalogModel("gemini-3.7-flash")
+		case strings.Contains(requested, "gemini"):
+			selected, found = preferredCatalogModel("gemini-4-argon")
 			if !found {
 				selected, found = preferredCatalogModel("gemini-3.8-flash")
-			}
-		case strings.Contains(requested, "gemini-3.6") || strings.Contains(requested, "flash-3.6"):
-			selected, found = preferredCatalogModel("gemini-3.6-flash")
-			if !found {
-				selected, found = preferredCatalogModel("gemini-3.8-flash")
-			}
-		case strings.Contains(requested, "gemini") && strings.Contains(requested, "pro"):
-			selected, found = preferredCatalogModel("gemini-3.1-pro")
-			if !found {
-				selected, found = preferredCatalogModel("gemini-4-argon")
 			}
 		case strings.Contains(requested, "opus"):
 			selected, found = preferredCatalogModel("claude-opus")
 		case strings.Contains(requested, "sonnet") || strings.Contains(requested, "claude"):
 			selected, found = preferredCatalogModel("claude-sonnet")
-		case strings.Contains(requested, "gpt-oss"):
+		case strings.Contains(requested, "gpt") || strings.Contains(requested, "oss"):
 			selected, found = preferredCatalogModel("gpt-oss")
 		}
+		if found {
+			log.Printf("[Models] Requested model %q dynamically resolved to %q", rawModel, selected.ID)
+		}
 	}
+
 	if !found {
 		return "", "", fmt.Errorf("unsupported model: %s", rawModel)
 	}
