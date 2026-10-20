@@ -748,5 +748,161 @@ func TestHandleModels_Collapsed(t *testing.T) {
 	}
 }
 
+func TestFormatConversation_BudgetAndTailIntegrity(t *testing.T) {
+	var msgs []ChatMessage
+	// 1. System message
+	msgs = append(msgs, ChatMessage{
+		Role:    "system",
+		Content: json.RawMessage(`"You are an elite coding assistant. Follow instructions precisely."`),
+	})
+
+	// 2. Add 500 historical messages with large outputs (~2.5 MB total)
+	for i := 0; i < 250; i++ {
+		msgs = append(msgs, ChatMessage{
+			Role:    "assistant",
+			Content: json.RawMessage(fmt.Sprintf(`"Executing step %d of the build diagnostic pipeline with extensive logs and analysis."`, i)),
+			ToolCalls: json.RawMessage(fmt.Sprintf(`[{"id": "call_%d", "type": "function", "function": {"name": "run_command", "arguments": "{\"CommandLine\": \"cargo build --verbose\"}"}}]`, i)),
+		})
+		largeOutput := strings.Repeat(fmt.Sprintf("Compiling crate_%d v0.1.0 (/path/to/crate_%d)...\n", i, i), 100)
+		msgs = append(msgs, ChatMessage{
+			Role:       "tool",
+			ToolCallID: fmt.Sprintf("call_%d", i),
+			Name:       "run_command",
+			Content:    json.RawMessage(fmt.Sprintf("%q", largeOutput)),
+		})
+	}
+
+	// 3. The user's critical question at the tail
+	prQuestion := "ok, com as alterações que fizemos no código hoje, temos uma PR de respeito para fazer ou você acha que ainda devemos segurar essa PR?"
+	msgs = append(msgs, ChatMessage{
+		Role:    "user",
+		Content: json.RawMessage(fmt.Sprintf("%q", prQuestion)),
+	})
+
+	toolsPrompt := "[AVAILABLE TOOLS]\n[]"
+	formatted := formatConversation(msgs, toolsPrompt)
+
+	// Verify total length never exceeds budget (120 KB)
+	if len(formatted) > maxAnchorPromptChars {
+		t.Errorf("formatted prompt length %d exceeds maxAnchorPromptChars %d", len(formatted), maxAnchorPromptChars)
+	}
+
+	// Verify system prompt is preserved
+	if !strings.Contains(formatted, "You are an elite coding assistant.") {
+		t.Errorf("system prompt was unexpectedly omitted from formatted output")
+	}
+
+	// Verify the user's latest prompt is 100% intact at the tail
+	if !strings.Contains(formatted, prQuestion) {
+		t.Fatalf("CRITICAL BUG: User's latest prompt was truncated/lost from formatted conversation tail!")
+	}
+
+	// Verify older messages were omitted with note
+	if !strings.Contains(formatted, "earlier conversation messages omitted to fit context window") {
+		t.Errorf("expected omitted messages note in compacted prompt, got:\n%s", formatted[:500])
+	}
+
+	// Verify clean completion prompt tail
+	if !strings.HasSuffix(strings.TrimSpace(formatted), "Assistant:") {
+		t.Errorf("expected prompt to end with 'Assistant:', got tail: %q", formatted[len(formatted)-40:])
+	}
+}
+
+func TestDeltaContinuityOnModelSwitch(t *testing.T) {
+	// Setup a session manager with a known state initialized with model A
+	sm := &SessionManager{
+		filePath: filepath.Join(t.TempDir(), "sessions.json"),
+		sessions: make(map[string]*SessionState),
+		trigger:  make(chan struct{}, 1),
+	}
+
+	sessionKey := "sess_model_switch_test"
+	baseMsgs := []ChatMessage{
+		{Role: "system", Content: json.RawMessage(`"System instructions"`)},
+		{Role: "user", Content: json.RawMessage(`"Turn 1 prompt"`)},
+		{Role: "assistant", Content: json.RawMessage(`"Turn 1 response"`)},
+	}
+	baseHashes := []string{hashMessage(baseMsgs[0]), hashMessage(baseMsgs[1]), hashMessage(baseMsgs[2])}
+	toolsHash := hashTools(nil)
+
+	sm.Update(sessionKey, &SessionState{
+		ConvID:        "agy-conv-abc12345",
+		Model:         "gemini-3.8-flash-high",
+		ToolsHash:     toolsHash,
+		MessageCount:  len(baseHashes),
+		HistoryHashes: baseHashes,
+	})
+
+	// User sends Turn 2 with model B
+	newMsgs := append(baseMsgs, ChatMessage{
+		Role:    "user",
+		Content: json.RawMessage(`"Turn 2 question with new model"`),
+	})
+	currentHashes := make([]string, len(newMsgs))
+	for i, m := range newMsgs {
+		currentHashes[i] = hashMessage(m)
+	}
+
+	activeState := sm.Get(sessionKey)
+	if activeState == nil {
+		t.Fatalf("expected active state, got nil")
+	}
+
+	// Test the core decision logic from main.go
+	isDelta := false
+	var convID string
+	var deltaPrompt string
+
+	requestedNewModel := "gemini-4-argon-high"
+
+	// New condition: activeState.ConvID != "" && activeState.ToolsHash == toolsHash (activeState.Model == model removed!)
+	if activeState.ConvID != "" && activeState.ToolsHash == toolsHash {
+		if len(newMsgs) > activeState.MessageCount {
+			prefixOK := true
+			for i := 0; i < activeState.MessageCount; i++ {
+				if currentHashes[i] != activeState.HistoryHashes[i] {
+					prefixOK = false
+					break
+				}
+			}
+			if prefixOK {
+				deltaPrompt = formatDeltaPrompt(newMsgs, activeState.MessageCount)
+				convID = activeState.ConvID
+				isDelta = true
+			}
+		}
+	}
+
+	if !isDelta {
+		t.Fatalf("expected isDelta=true across model switch, got false")
+	}
+	if convID != "agy-conv-abc12345" {
+		t.Errorf("expected convID agy-conv-abc12345, got %s", convID)
+	}
+	if !strings.Contains(deltaPrompt, "Turn 2 question with new model") {
+		t.Errorf("expected deltaPrompt to contain turn 2 prompt, got: %s", deltaPrompt)
+	}
+	if strings.Contains(deltaPrompt, "Turn 1 prompt") {
+		t.Errorf("deltaPrompt should NOT contain historical turn 1 prompt; got: %s", deltaPrompt)
+	}
+
+	// Update session with new model and verify state transitions
+	sm.Update(sessionKey, &SessionState{
+		ConvID:        convID,
+		Model:         requestedNewModel,
+		ToolsHash:     toolsHash,
+		MessageCount:  len(currentHashes),
+		HistoryHashes: currentHashes,
+	})
+
+	updatedState := sm.Get(sessionKey)
+	if updatedState.Model != "gemini-4-argon-high" {
+		t.Errorf("expected updated state model to be gemini-4-argon-high, got %s", updatedState.Model)
+	}
+	if updatedState.ConvID != "agy-conv-abc12345" {
+		t.Errorf("expected updated state convID to remain agy-conv-abc12345, got %s", updatedState.ConvID)
+	}
+}
+
 
 

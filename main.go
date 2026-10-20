@@ -625,6 +625,8 @@ func buildToolCallMap(messages []ChatMessage) map[string]string {
 	return m
 }
 
+const maxAnchorPromptChars = 120000 // 120 KB safe buffer limit for AGY anchor prompts
+
 func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 	var sb strings.Builder
 	if toolsPrompt != "" {
@@ -632,18 +634,68 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 		sb.WriteString("\n\n")
 	}
 
+	reminder := ""
+	if toolsPrompt != "" {
+		reminder = "[CRITICAL REMINDER]\n" +
+			"You are the completion engine for the AI Agent. Do NOT invoke local tools directly.\n" +
+			"- If an action/tool call is genuinely needed, choose from [AVAILABLE TOOLS] and respond with:\n" +
+			"<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n" +
+			"- When dispatching subagents (e.g. 'delegate_task'), inform the user before <tool_call> of the subagent's goal.\n" +
+			"- If asked about subagents or background tasks, invoke 'delegate_task' with {\"action\": \"list\"} and report active subagents.\n" +
+			"- NEVER simulate tool execution or fake tool results (do NOT write '[Tool Result for ...]').\n" +
+			"- When calling a tool, STOP immediately after </tool_call>. Wait for the real tool result before providing explanations or final deliverables.\n" +
+			"- If the user request is satisfied or no further tool is needed, DO NOT call tools. Respond directly in normal text with your final response.\n\n"
+	}
+	footer := reminder + "Assistant:"
+
 	toolCallMap := buildToolCallMap(messages)
 	totalMsgs := len(messages)
+
+	// Keep the most recent 6 messages in the high-fidelity window
+	recentWindowSize := 6
+	cutoff := totalMsgs - recentWindowSize
+	if cutoff < 0 {
+		cutoff = 0
+	}
+
+	// Format each message individually with appropriate fidelity level
+	rendered := make([]string, totalMsgs)
 	for i, msg := range messages {
+		isHistorical := i < cutoff && i > 0 // message 0 is system instructions; messages >= cutoff are recent window
 		c := msg.ContentString()
+
 		switch msg.Role {
 		case "system":
-			sb.WriteString("[System Instructions]:\n" + c + "\n\n")
+			if len(c) > 20000 {
+				c = c[:10000] + "\n\n[... system instructions middle truncated ...]\n\n" + c[len(c)-8000:]
+			}
+			rendered[i] = "[System Instructions]:\n" + c + "\n\n"
+
 		case "user":
-			sb.WriteString("User: " + c + "\n\n")
+			if isHistorical {
+				if len(c) > 1000 {
+					c = c[:600] + "\n\n[... historical user prompt truncated ...]\n\n" + c[len(c)-200:]
+				}
+			} else {
+				if len(c) > 50000 {
+					c = c[:25000] + "\n\n[... user input middle truncated to fit buffer ...]\n\n" + c[len(c)-25000:]
+				}
+			}
+			rendered[i] = "User: " + c + "\n\n"
+
 		case "assistant":
+			var asb strings.Builder
 			if c != "" {
-				sb.WriteString("Assistant: " + c + "\n\n")
+				if isHistorical {
+					if len(c) > 800 {
+						c = c[:400] + "\n\n[... historical assistant response truncated ...]\n\n" + c[len(c)-200:]
+					}
+				} else {
+					if len(c) > 8000 {
+						c = c[:4000] + "\n\n[... content truncated for brevity ...]\n\n" + c[len(c)-2000:]
+					}
+				}
+				asb.WriteString("Assistant: " + c + "\n\n")
 			}
 			if len(msg.ToolCalls) > 0 && string(msg.ToolCalls) != "null" {
 				var tcList []struct {
@@ -660,9 +712,14 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 						_ = json.Unmarshal(tc.Function.Arguments, &unq)
 						argStr = unq
 					}
-					sb.WriteString(fmt.Sprintf("<tool_call>\n{\"name\": \"%s\", \"arguments\": %s}\n</tool_call>\n\n", tc.Function.Name, argStr))
+					if isHistorical && len(argStr) > 400 {
+						argStr = argStr[:200] + "...}"
+					}
+					asb.WriteString(fmt.Sprintf("<tool_call>\n{\"name\": \"%s\", \"arguments\": %s}\n</tool_call>\n\n", tc.Function.Name, argStr))
 				}
 			}
+			rendered[i] = asb.String()
+
 		case "tool":
 			toolName := msg.Name
 			if (toolName == "" || toolName == "tool") && msg.ToolCallID != "" {
@@ -673,28 +730,61 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 			if toolName == "" {
 				toolName = "tool"
 			}
-			// If tool result is historical (not in the last 4 messages) and large (> 4000 chars),
-			// truncate the middle to keep prompt size manageable and prevent gRPC stream stall.
-			if totalMsgs-i > 4 && len(c) > 4000 {
-				c = c[:2000] + "\n\n[... content truncated for brevity ...]\n\n" + c[len(c)-1000:]
+			if isHistorical {
+				if len(c) > 400 {
+					c = c[:250] + "\n\n[... historical output truncated ...]\n\n" + c[len(c)-100:]
+				}
+			} else {
+				if len(c) > 4000 {
+					c = c[:2000] + "\n\n[... content truncated for brevity ...]\n\n" + c[len(c)-1000:]
+				}
 			}
-			sb.WriteString(fmt.Sprintf("[Tool Result for '%s']:\n%s\n\n", toolName, c))
+			rendered[i] = fmt.Sprintf("[Tool Result for '%s']:\n%s\n\n", toolName, c)
 		}
 	}
 
-	if toolsPrompt != "" {
-		sb.WriteString("[CRITICAL REMINDER]\n")
-		sb.WriteString("You are the completion engine for the AI Agent. Do NOT invoke local tools directly.\n")
-		sb.WriteString("- If an action/tool call is genuinely needed, choose from [AVAILABLE TOOLS] and respond with:\n")
-		sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n")
-		sb.WriteString("- When dispatching subagents (e.g. 'delegate_task'), inform the user before <tool_call> of the subagent's goal.\n")
-		sb.WriteString("- If asked about subagents or background tasks, invoke 'delegate_task' with {\"action\": \"list\"} and report active subagents.\n")
-		sb.WriteString("- NEVER simulate tool execution or fake tool results (do NOT write '[Tool Result for ...]').\n")
-		sb.WriteString("- When calling a tool, STOP immediately after </tool_call>. Wait for the real tool result before providing explanations or final deliverables.\n")
-		sb.WriteString("- If the user request is satisfied or no further tool is needed, DO NOT call tools. Respond directly in normal text with your final response.\n\n")
+	// Calculate budget
+	fixedLen := sb.Len() + len(footer)
+	availableForMessages := maxAnchorPromptChars - fixedLen
+	if availableForMessages < 20000 {
+		availableForMessages = 20000
 	}
 
-	sb.WriteString("Assistant:")
+	totalMsgLen := 0
+	for _, r := range rendered {
+		totalMsgLen += len(r)
+	}
+
+	// If total message length exceeds budget, prune oldest historical messages
+	// Keep message 0 if it's system; keep recent window (cutoff..end); prune from start of historical
+	omittedCount := 0
+	startHistoricalIdx := 0
+	if totalMsgs > 0 && messages[0].Role == "system" {
+		startHistoricalIdx = 1
+	}
+
+	currIdx := startHistoricalIdx
+	for totalMsgLen > availableForMessages && currIdx < cutoff {
+		totalMsgLen -= len(rendered[currIdx])
+		rendered[currIdx] = ""
+		currIdx++
+		omittedCount++
+	}
+
+	// Write messages
+	if totalMsgs > 0 && messages[0].Role == "system" {
+		sb.WriteString(rendered[0])
+	}
+	if omittedCount > 0 {
+		sb.WriteString(fmt.Sprintf("[... Note: %d earlier conversation messages omitted to fit context window ...]\n\n", omittedCount))
+	}
+	for i := currIdx; i < totalMsgs; i++ {
+		if rendered[i] != "" {
+			sb.WriteString(rendered[i])
+		}
+	}
+
+	sb.WriteString(footer)
 	return sb.String()
 }
 
@@ -730,10 +820,16 @@ func formatDeltaPrompt(messages []ChatMessage, startIndex int) string {
 			sb.WriteString(fmt.Sprintf("[Tool Result for '%s']:\n%s\n\n", toolName, c))
 
 		case "user":
+			if len(c) > 50000 {
+				c = c[:25000] + "\n\n[... user input middle truncated to fit buffer ...]\n\n" + c[len(c)-25000:]
+			}
 			sb.WriteString("User: " + c + "\n\n")
 
 		case "assistant":
 			if c != "" {
+				if len(c) > 8000 {
+					c = c[:4000] + "\n\n[... content truncated for brevity ...]\n\n" + c[len(c)-2000:]
+				}
 				sb.WriteString("Assistant: " + c + "\n\n")
 			}
 			if len(msg.ToolCalls) > 0 && string(msg.ToolCalls) != "null" {
@@ -1763,7 +1859,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	toolsPrompt := formatToolsPrompt(req.Tools)
 	fallbackFullPrompt = formatConversation(req.Messages, toolsPrompt)
 
-	if activeState != nil && activeState.ConvID != "" && activeState.Model == model && activeState.ToolsHash == toolsHash {
+	if activeState != nil && activeState.ConvID != "" && activeState.ToolsHash == toolsHash {
 		if len(req.Messages) > activeState.MessageCount {
 			prefixOK := true
 			if len(activeState.HistoryHashes) < activeState.MessageCount || len(currentHashes) < activeState.MessageCount {
@@ -1781,8 +1877,13 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				finalPrompt = formatDeltaPrompt(req.Messages, activeState.MessageCount)
 				convID = activeState.ConvID
 				isDelta = true
-				log.Printf("[Proxy-Delta] Session %s continuing conv %s: delta (%d chars) for msgs %d..%d",
-					sessionKey, convID, len(finalPrompt), activeState.MessageCount, len(req.Messages))
+				if activeState.Model != model {
+					log.Printf("[Proxy-Delta] Session %s continuing conv %s with switched model: %s -> %s: delta (%d chars) for msgs %d..%d",
+						sessionKey, convID, activeState.Model, model, len(finalPrompt), activeState.MessageCount, len(req.Messages))
+				} else {
+					log.Printf("[Proxy-Delta] Session %s continuing conv %s: delta (%d chars) for msgs %d..%d",
+						sessionKey, convID, len(finalPrompt), activeState.MessageCount, len(req.Messages))
+				}
 			} else {
 				log.Printf("[Proxy-Delta] Desync detected for session %s (prefix changed). Re-anchoring.", sessionKey)
 				globalSessions.Invalidate(sessionKey)
@@ -1803,8 +1904,13 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				finalPrompt = formatDeltaPrompt(req.Messages, activeState.MessageCount-1)
 				convID = activeState.ConvID
 				isDelta = true
-				log.Printf("[Proxy-Delta] Session %s reprompt on same conv %s: delta (%d chars) for msg %d",
-					sessionKey, convID, len(finalPrompt), activeState.MessageCount-1)
+				if activeState.Model != model {
+					log.Printf("[Proxy-Delta] Session %s reprompt on conv %s with switched model: %s -> %s: delta (%d chars) for msg %d",
+						sessionKey, convID, activeState.Model, model, len(finalPrompt), activeState.MessageCount-1)
+				} else {
+					log.Printf("[Proxy-Delta] Session %s reprompt on same conv %s: delta (%d chars) for msg %d",
+						sessionKey, convID, len(finalPrompt), activeState.MessageCount-1)
+				}
 			}
 		} else if len(req.Messages) < activeState.MessageCount {
 			log.Printf("[Proxy-Delta] History truncation/compaction detected for session %s. Re-anchoring.", sessionKey)
