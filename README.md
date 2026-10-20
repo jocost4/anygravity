@@ -126,10 +126,21 @@ Measured on an Ubuntu 24.04 VPS (1 vCPU, 1 GB RAM):
 ```bash
 git clone https://github.com/jocost4/anygravity.git
 cd anygravity
+
+# System-wide install (runs under your detected user):
 sudo ./install.sh
+
+# Or rootless user-mode install (ideal for WSL & desktops without sudo):
+./install.sh --user
 ```
 
-The script compiles the static binary, installs it to `/usr/local/bin/anygravity` (with `/usr/local/bin/hermesgravity` symlink for backwards compatibility), creates a systemd service hardened to 64MB memory max for your current user, and starts the daemon.
+The script compiles the static binary, installs it, automatically detects your user and home directory, generates the systemd service hardened to 64MB memory max, and starts the daemon.
+
+For manual multi-user installations without the script, you can use the included template unit:
+```bash
+sudo cp systemd/anygravity@.service /etc/systemd/system/
+sudo systemctl enable --now anygravity@$USER.service
+```
 
 ### 2. Service Management
 ```bash
@@ -150,19 +161,17 @@ sudo systemctl restart anygravity
 Add the custom provider to `~/.hermes/config.yaml`:
 
 ```yaml
-model:
-  provider: custom
-  default: gemini-3.8-flash-high
-  custom_providers:
-    antigravity:
-      base_url: http://localhost:20130/v1
-      api_key: agy-local
+custom_providers:
+  - name: Anygravity (localhost:20130)
+    base_url: http://localhost:20130/v1
+    api_key: anygravity-local
 ```
 
-### Or configure via Hermes CLI:
+*(Models are discovered automatically via `GET /v1/models` — you do not need to list models manually in `config.yaml`)*
+
+### Set default model in Hermes:
 ```bash
-hermes config set model.provider custom
-hermes config set model.default gemini-3.8-flash-high
+hermes config set model.default gemini-4-argon
 ```
 
 ---

@@ -482,7 +482,6 @@ func refreshModelRegistry(ctx context.Context) {
 	}
 	models := registry.GetModels()
 	log.Printf("[Models] Loaded %d models from agy", len(models))
-	syncHermesConfig(models)
 }
 
 func modelBaseAndEffort(modelID string) (base, embeddedEffort string) {
@@ -524,73 +523,6 @@ func getBaseModels() []ModelItem {
 		})
 	}
 	return baseModels
-}
-
-func syncHermesConfig(models []ModelItem) {
-	baseModels := getBaseModels()
-	if len(baseModels) == 0 {
-		return
-	}
-	configPath := filepath.Join(os.Getenv("HOME"), ".hermes/config.yaml")
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return
-	}
-
-	content := string(data)
-	const marker = "name: Anygravity (localhost:20130)"
-	idx := strings.Index(content, marker)
-	if idx == -1 {
-		return
-	}
-
-	modelsIdx := strings.Index(content[idx:], "models:")
-	if modelsIdx == -1 {
-		return
-	}
-	absModelsIdx := idx + modelsIdx
-
-	rest := content[absModelsIdx:]
-	lines := strings.Split(rest, "\n")
-	var newModelsLines []string
-	newModelsLines = append(newModelsLines, "models:")
-	for _, bm := range baseModels {
-		newModelsLines = append(newModelsLines, fmt.Sprintf("      %s: {}", bm.ID))
-	}
-
-	endLineIdx := -1
-	for i := 1; i < len(lines); i++ {
-		line := lines[i]
-		if strings.HasPrefix(line, "  - ") || (len(line) > 0 && line[0] != ' ' && line[0] != '#') {
-			endLineIdx = i
-			break
-		}
-	}
-
-	if endLineIdx == -1 {
-		endLineIdx = len(lines)
-	}
-
-	before := content[:absModelsIdx]
-	after := strings.Join(lines[endLineIdx:], "\n")
-	newBlock := strings.Join(newModelsLines, "\n")
-
-	var updated string
-	if after != "" {
-		updated = before + newBlock + "\n" + after
-	} else {
-		updated = before + newBlock + "\n"
-	}
-
-	if updated != content {
-		if err := os.WriteFile(configPath, []byte(updated), 0644); err == nil {
-			var names []string
-			for _, bm := range baseModels {
-				names = append(names, bm.ID)
-			}
-			log.Printf("[Models] Synced %d active model families into ~/.hermes/config.yaml: %v", len(baseModels), names)
-		}
-	}
 }
 
 // -----------------------------------------------------------------------------

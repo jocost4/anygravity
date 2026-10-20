@@ -4,11 +4,14 @@ After=network.target
 
 [Service]
 Type=exec
-User=ubuntu
-Environment=HOME=/home/ubuntu
-Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+# NOTE: Set to your actual username and home directory if installing manually without install.sh.
+# Alternatively, use: sudo systemctl enable --now anygravity@<your-user>.service
+# Or for rootless/user mode: systemctl --user enable --now anygravity.service
+User=%i
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PORT=20130
-WorkingDirectory=/home/ubuntu
+WorkingDirectory=%h
 ExecStart=/usr/local/bin/anygravity
 Restart=always
 RestartSec=3
