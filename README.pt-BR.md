@@ -89,6 +89,21 @@ Criado para operar com estabilidade absoluta em ambientes com poucos recursos (c
     - Habilita 100% de reaproveitamento de KV Cache nos backends Gemini/Claude, despencando o TTFT multi-turno para centenas de milissegundos.
     - Possui salvaguardas de auto-cura contra desync que tratam podas/compactações de contexto, reprompts e isolamento de tarefas efêmeras (títulos, guardrails, reflexão de memória), mantendo **estritamente 1 única conversa por sessão** no Brain do Antigravity.
 
+11. **Finalização Limpa de Subprocessos & Anti-Congelamento**:
+    - Subprocessos em background gerados durante as tarefas da CLI (como servidores MCP em segundo plano, drivers de computer-use como `cua-driver.exe` e telemetria) mantinham descritores abertos, fazendo wrappers padrão travarem no `cmd.Wait()` até o timeout de 600s.
+    - O Anygravity intercepta o evento de conclusão (`{"event": "result"}`), persiste o estado da sessão imediatamente, faz o flush da resposta completa e aplica uma janela de tolerância de 500ms seguida do encerramento seguro do grupo de processos (`syscall.Kill(-pid, SIGKILL)`).
+
+12. **Higienização de Tool-Results Alucinados & Anti-Duplicação**:
+    - Modelos Gemini ocasionalmente alucinam blocos simulados de `[Tool Result for '...']:` e respostas antecipadas antes ou imediatamente após gerarem `<tool_call>`.
+    - O Anygravity remove esses logs de ferramentas alucinadas e descarta preâmbulos pós-ferramenta, garantindo que as respostas nunca saiam duplicadas na interface e que as ferramentas sejam executadas estritamente pelo agente cliente.
+
+13. **Modelos Base Enxutos & Mapeamento Dinâmico de Reasoning Effort**:
+    - O catálogo bruto com 13 variantes individuais de modelo/esforço é agrupado em 5 famílias limpas de modelos base (`gemini-4-argon`, `gemini-3.8-flash`, `claude-opus-5-5`, `claude-sonnet-5-5`, `gpt-oss-120b`).
+    - Parâmetros padrão da OpenAI como `reasoning_effort` (ou o seletor de EFFORT do Hermes: Minimal, Low, Medium, High) resolvem dinamicamente para a variante exata do catálogo sem poluir os menus com 3 cópias do mesmo modelo.
+
+14. **Visibilidade de Subagentes & Anúncios de Delegação Paralela**:
+    - Ao delegar subtarefas (`delegate_task`, `subagents`), o Anygravity detecta arrays em lote e delegações paralelas, emitindo anúncios de status explícitos para que o orquestrador (como o Hermes) acompanhe visualmente o progresso dos subagentes em segundo plano.
+
 ---
 
 ## 📐 Arquitetura
@@ -97,7 +112,7 @@ Criado para operar com estabilidade absoluta em ambientes com poucos recursos (c
 flowchart LR
     A["Qualquer Agente de IA<br>(Hermes, Claude Code, Cursor, etc.)"] -->|OpenAI SSE /v1/chat/completions| B["Anygravity Go Proxy :20130"]
     B -->|Concurrent Stdin Stream| C["Google Antigravity CLI"]
-    C -->|Gemini 3.8 / Claude 4.6| D(("Google / Anthropic AI"))
+    C -->|Gemini 4 / Claude 5.5 / GPT-OSS| D(("Google / Anthropic AI"))
     C -.->|transcript.jsonl| B
     B -->|reasoning_content + tool_calls| A
 ```
@@ -141,6 +156,8 @@ sudo systemctl enable --now anygravity@$USER.service
 ```
 
 ### 2. Comandos do Serviço Systemd
+
+**Para instalação no sistema todo (`sudo ./install.sh`):**
 ```bash
 # Ver status em tempo real
 sudo systemctl status anygravity
@@ -150,6 +167,18 @@ sudo journalctl -u anygravity -f
 
 # Reiniciar serviço
 sudo systemctl restart anygravity
+```
+
+**Para instalação em modo de usuário sem root (`./install.sh --user`):**
+```bash
+# Ver status em tempo real
+systemctl --user status anygravity
+
+# Acompanhar logs
+journalctl --user -u anygravity -f
+
+# Reiniciar serviço
+systemctl --user restart anygravity
 ```
 
 ---
@@ -196,29 +225,33 @@ mcp_servers:
 
 ---
 
-## 🎯 Modelos Suportados
+## 🎯 Modelos Suportados & Reasoning Effort Dinâmico
 
-O Anygravity consulta e suporta os modelos da sua instalação local do `agy`:
+O Anygravity consulta e suporta dinamicamente os modelos da sua instalação local do `agy`. As variantes são agrupadas em famílias de modelos base limpas:
 
-| ID do modelo | Nome | Observações |
-| :--- | :--- | :--- |
-| `gemini-3.8-flash-high` | Gemini 3.8 Flash (High) | **Padrão** — modelo Google com raciocínio alto |
-| `gemini-3.8-flash-medium` | Gemini 3.8 Flash (Medium) | Equilíbrio entre velocidade e profundidade |
-| `gemini-3.8-flash-low` | Gemini 3.8 Flash (Low) | Menor latência entre os Gemini |
-| `claude-opus-5-5-{low,medium,high}` | Claude Opus 5.5 | Três níveis de esforço disponíveis |
-| `claude-sonnet-5-5-{low,medium,high}` | Claude Sonnet 5.5 | Três níveis de esforço disponíveis |
-| `gpt-oss-120b-medium` | GPT-OSS 120B (Medium) | Modelo open-weights hospedado no Google Cloud |
+| ID do Modelo (Base) | Nome | Níveis de Esforço Suportados | Observações |
+| :--- | :--- | :--- | :--- |
+| `gemini-4-argon` | Gemini 4 Argon | `high`, `medium`, `low` | **Flagship** — ponta de linha do Google com raciocínio e coding avançados |
+| `gemini-3.8-flash` | Gemini 3.8 Flash | `high`, `medium`, `low` | Modelo multimodal ultra-rápido |
+| `claude-opus-5-5` | Claude Opus 5.5 | `high`, `medium`, `low` | Raciocínio analítico profundo e design de arquitetura |
+| `claude-sonnet-5-5` | Claude Sonnet 5.5 | `high`, `medium`, `low` | Orquestração agentic e programação de alta velocidade |
+| `gpt-oss-120b` | GPT-OSS 120B | `medium` | Modelo open-weights hospedado no Google Cloud |
 
-O proxy atualiza o catálogo via `agy models` na inicialização e a cada cinco minutos; assim, modelos habilitados depois aparecem sem novo release. A lista de fallback só é usada se a CLI estiver temporariamente indisponível.
+### Como Funciona o Reasoning Effort:
+- **Seletor de EFFORT no Hermes**: Na interface do Hermes, basta selecionar o nível desejado (**Minimal**, **Low**, **Medium**, **High**) no menu do modelo.
+- **API OpenAI Padrão**: Envie `"reasoning_effort": "medium"` (ou `"high"` / `"low"`) na requisição. O Anygravity mapeia dinamicamente para a variante exata do backend (ex.: `gemini-4-argon` + `medium` → `gemini-4-argon-medium`). O padrão é `high` quando omitido.
+- **Retrocompatibilidade**: IDs explícitos como `gemini-4-argon-high` ou `claude-sonnet-5-5-medium` continuam funcionando diretamente se forem solicitados.
+
+O proxy atualiza o catálogo via `agy models` na inicialização e periodicamente em segundo plano, para que novos modelos disponibilizados pelo Google apareçam automaticamente sem necessidade de update do código.
 
 ---
 
 ## 🧪 Suite de Testes
 
-Execute a suite de testes unitários que cobre parsing de ferramentas, normalização de argumentos, hash de sessão e deduplicação de streaming:
+Execute a suite de testes unitários que cobre parsing de ferramentas, normalização de argumentos, hash de sessão, resolução de modelos agrupados e deduplicação de streaming:
 
 ```bash
-cd /home/jojo_cost4/anygravity
+cd anygravity
 go test -v ./...
 ```
 

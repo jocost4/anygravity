@@ -91,6 +91,21 @@ Bridging a CLI assistant with an autonomous agent orchestrator presents unique a
     - Unlocks 100% KV Cache hits on Gemini/Claude backends, dropping multi-turn TTFT to sub-second speeds.
     - Features self-healing desync guards that automatically handle history compaction, reprompts, and auxiliary task isolation (titling, guardrails, memory updates), strictly preserving **1 single conversation per session** in the Antigravity Brain.
 
+11. **Clean Process Group Teardown & Anti-Hang Engine**:
+    - Subprocesses spawned during CLI tasks (such as background MCP servers, computer-use drivers like `cua-driver.exe`, and telemetry handles) can keep file descriptors open, causing standard wrappers to freeze on `cmd.Wait()` until timing out.
+    - Anygravity intercepts the completion event (`{"event": "result"}`), immediately commits session state, flushes the complete response, and enforces a graceful 500ms termination window followed by process group cleanup (`syscall.Kill(-pid, SIGKILL)`).
+
+12. **Hallucinated Tool-Result Cleanup & Anti-Duplication**:
+    - Gemini models occasionally hallucinate simulated `[Tool Result for '...']:` blocks and premature answers before or immediately after generating `<tool_call>`.
+    - Anygravity scrubs fake tool execution logs and strips post-tool preambles so that responses are never duplicated in the user interface and tools execute strictly on the client agent.
+
+13. **Collapsed Model Families & Dynamic Reasoning Effort Mapping**:
+    - The raw catalog containing 13 individual model-effort variants is collapsed into 5 clean base model families (`gemini-4-argon`, `gemini-3.8-flash`, `claude-opus-5-5`, `claude-sonnet-5-5`, `gpt-oss-120b`).
+    - Standard OpenAI `reasoning_effort` parameters (or the Hermes EFFORT picker: Minimal, Low, Medium, High) dynamically resolve to the exact underlying backend variant without cluttering dropdown menus with 3 duplicates per model.
+
+14. **Subagent Visibility & Parallel Task Announcements**:
+    - When delegating sub-tasks (`delegate_task`, `subagents`), Anygravity detects batch arrays and parallel task delegations, streaming explicit status announcements so orchestrators (like Hermes) always display subagent dispatch progress clearly.
+
 ---
 
 ## 📐 Architecture
@@ -99,7 +114,7 @@ Bridging a CLI assistant with an autonomous agent orchestrator presents unique a
 flowchart LR
     A["Any AI Agent<br>(Hermes, Claude Code, Cursor, etc.)"] -->|OpenAI SSE /v1/chat/completions| B["Anygravity Go Proxy :20130"]
     B -->|Concurrent Stdin Stream| C["Google Antigravity CLI"]
-    C -->|Gemini 3.8 / Claude 4.6| D(("Google / Anthropic AI"))
+    C -->|Gemini 4 / Claude 5.5 / GPT-OSS| D(("Google / Anthropic AI"))
     C -.->|transcript.jsonl| B
     B -->|reasoning_content + tool_calls| A
 ```
@@ -143,6 +158,8 @@ sudo systemctl enable --now anygravity@$USER.service
 ```
 
 ### 2. Service Management
+
+**For system-wide installs (`sudo ./install.sh`):**
 ```bash
 # Check status
 sudo systemctl status anygravity
@@ -152,6 +169,18 @@ sudo journalctl -u anygravity -f
 
 # Restart daemon
 sudo systemctl restart anygravity
+```
+
+**For user-mode / rootless installs (`./install.sh --user`):**
+```bash
+# Check status
+systemctl --user status anygravity
+
+# Tail live logs
+journalctl --user -u anygravity -f
+
+# Restart daemon
+systemctl --user restart anygravity
 ```
 
 ---
@@ -198,29 +227,33 @@ mcp_servers:
 
 ---
 
-## 🎯 Supported Models
+## 🎯 Supported Models & Dynamic Reasoning Effort
 
-Anygravity dynamically queries and supports the models available on your local `agy` installation:
+Anygravity dynamically queries and supports the models available on your local `agy` installation. Catalog variants are collapsed into base model families with dynamic reasoning effort:
 
-| Model ID | Name | Notes |
-| :--- | :--- | :--- |
-| `gemini-3.8-flash-high` | Gemini 3.8 Flash (High) | **Default** — high-reasoning Google model |
-| `gemini-3.8-flash-medium` | Gemini 3.8 Flash (Medium) | Balanced speed and reasoning |
-| `gemini-3.8-flash-low` | Gemini 3.8 Flash (Low) | Lowest-latency Gemini option |
-| `claude-opus-5-5-{low,medium,high}` | Claude Opus 5.5 | Available at three effort levels |
-| `claude-sonnet-5-5-{low,medium,high}` | Claude Sonnet 5.5 | Available at three effort levels |
-| `gpt-oss-120b-medium` | GPT-OSS 120B (Medium) | Open-weights model hosted on Google Cloud |
+| Model ID (Base) | Name | Reasoning Effort Tiers | Notes |
+| :--- | :--- | :--- | :--- |
+| `gemini-4-argon` | Gemini 4 Argon | `high`, `medium`, `low` | **Flagship** — state-of-the-art coding and reasoning |
+| `gemini-3.8-flash` | Gemini 3.8 Flash | `high`, `medium`, `low` | Ultra-fast multimodal model |
+| `claude-opus-5-5` | Claude Opus 5.5 | `high`, `medium`, `low` | Deep analytical reasoning & architecture design |
+| `claude-sonnet-5-5` | Claude Sonnet 5.5 | `high`, `medium`, `low` | High-speed coding & agentic orchestration |
+| `gpt-oss-120b` | GPT-OSS 120B | `medium` | Open-weights model hosted on Google Cloud infrastructure |
 
-The proxy refreshes the catalog from `agy models` at startup and every five minutes, so newly enabled Antigravity models appear without a code release. The fallback list is used only if the CLI is temporarily unavailable.
+### How Reasoning Effort Works:
+- **Hermes EFFORT Picker**: When using the Hermes UI, select any reasoning level (**Minimal**, **Low**, **Medium**, **High**) in the model flyout menu.
+- **OpenAI API**: Send `"reasoning_effort": "medium"` (or `"high"` / `"low"`) in `/v1/chat/completions`. Anygravity resolves it dynamically to the corresponding backend model variant (e.g., `gemini-4-argon` + `medium` → `gemini-4-argon-medium`). Defaults to `high` if omitted.
+- **Backwards Compatibility**: Explicit variant IDs like `gemini-4-argon-high` or `claude-sonnet-5-5-medium` are still resolved directly.
+
+The proxy refreshes the catalog from `agy models` at startup and periodically, so newly enabled Antigravity models appear automatically without requiring a proxy update.
 
 ---
 
 ## 🧪 Test Suite
 
-Run the unit test suite covering tool parsing, argument normalization, session key extraction, and streaming deduplication:
+Run the unit test suite covering tool parsing, argument normalization, session key extraction, collapsed model resolution, and streaming deduplication:
 
 ```bash
-cd /home/jojo_cost4/anygravity
+cd anygravity
 go test -v ./...
 ```
 
