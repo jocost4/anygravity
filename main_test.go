@@ -91,8 +91,22 @@ func TestExtractSessionKey(t *testing.T) {
 		t.Errorf("expected hdr_sess_12345, got %s", key)
 	}
 
-	// Fallback to hashing system prompt and first user message
 	emptyHdr := http.Header{}
+
+	// Direct detection: Session ID in system prompt
+	sidMsgs := []ChatMessage{
+		{Role: "system", Content: json.RawMessage(`"You are a helpful assistant.\n\nSession ID: 20261020_064839_a26d4b\nModel: gemini-3.8-flash"`)},
+		{Role: "user", Content: json.RawMessage(`"Hello world!"`)},
+	}
+	keySID, isAuxSID := extractSessionKey(sidMsgs, nil, emptyHdr)
+	if isAuxSID {
+		t.Errorf("expected isAuxSID=false, got true")
+	}
+	if keySID != "sid_20261020_064839_a26d4b" {
+		t.Errorf("expected sid_20261020_064839_a26d4b, got %s", keySID)
+	}
+
+	// Fallback to hashing system prompt and first user message
 	msgs := []ChatMessage{
 		{Role: "system", Content: json.RawMessage(`"You are a helpful assistant."`)},
 		{Role: "user", Content: json.RawMessage(`"Hello world!"`)},

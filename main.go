@@ -392,6 +392,23 @@ func extractSessionKey(messages []ChatMessage, tools []ToolItem, headers http.He
 		}
 	}
 
+	// Direct detection: check for explicit Session ID passed in system prompt or message trailer
+	for _, m := range messages {
+		if m.Role == "system" {
+			s := m.ContentString()
+			if idx := strings.Index(s, "Session ID: "); idx != -1 {
+				sub := s[idx+len("Session ID: "):]
+				if endIdx := strings.IndexAny(sub, "\r\n\t "); endIdx != -1 {
+					sub = sub[:endIdx]
+				}
+				sid := strings.TrimSpace(sub)
+				if sid != "" {
+					return "sid_" + sid, false
+				}
+			}
+		}
+	}
+
 	systemText := ""
 	firstUser := ""
 	for _, m := range messages {
