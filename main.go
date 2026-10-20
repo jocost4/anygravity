@@ -1881,6 +1881,7 @@ func handleStreamingCompletion(
 	isBufferingTool := false
 	var lastWaitErr error
 	var lastStderr string
+	var agyResultReceived bool
 
 	for attempt := 1; attempt <= 2; attempt++ {
 		if attempt > 1 {
@@ -1889,6 +1890,7 @@ func handleStreamingCompletion(
 			streamedText.Reset()
 			streamPending.Reset()
 			isBufferingTool = false
+			agyResultReceived = false
 			time.Sleep(500 * time.Millisecond)
 
 			if isDelta {
@@ -1976,6 +1978,13 @@ func handleStreamingCompletion(
 			err  error
 		}
 		eventChan := make(chan streamEvent, 4096)
+		streamDone := make(chan struct{})
+		var closeOnce sync.Once
+		safeCloseStreamDone := func() {
+			closeOnce.Do(func() {
+				close(streamDone)
+			})
+		}
 
 		go func() {
 			defer close(eventChan)
@@ -1990,12 +1999,16 @@ func handleStreamingCompletion(
 				case eventChan <- streamEvent{line: b}:
 				case <-ctx.Done():
 					return
+				case <-streamDone:
+					return
 				}
 			}
 			if err := scanner.Err(); err != nil {
 				select {
 				case eventChan <- streamEvent{err: err}:
 				case <-ctx.Done():
+					return
+				case <-streamDone:
 					return
 				}
 			}
@@ -2019,6 +2032,8 @@ func handleStreamingCompletion(
 				} `json:"step_update"`
 				Result struct {
 					ConversationID string `json:"conversation_id"`
+					Status         string `json:"status"`
+					Response       string `json:"response"`
 				} `json:"result"`
 			}
 
@@ -2028,8 +2043,18 @@ func handleStreamingCompletion(
 
 			if event.Event == "init" && event.ConversationID != "" {
 				activeConvID = event.ConversationID
-			} else if event.Event == "result" && event.Result.ConversationID != "" {
-				activeConvID = event.Result.ConversationID
+			} else if event.Event == "result" {
+				if event.Result.ConversationID != "" {
+					activeConvID = event.Result.ConversationID
+				} else if event.ConversationID != "" {
+					activeConvID = event.ConversationID
+				}
+				if accumulatedText.Len() == 0 && event.Result.Response != "" {
+					accumulatedText.WriteString(event.Result.Response)
+				}
+				agyResultReceived = true
+				safeCloseStreamDone()
+				break
 			} else if event.Event == "step_update" {
 				delta := event.StepUpdate.TextDelta
 				if delta != "" {
@@ -2096,6 +2121,7 @@ func handleStreamingCompletion(
 				}
 			}
 		}
+		safeCloseStreamDone()
 
 		// Flush any pending text if no tool call was encountered
 		if !isBufferingTool && streamPending.Len() > 0 {
@@ -2105,14 +2131,37 @@ func handleStreamingCompletion(
 			streamPending.Reset()
 		}
 
-		lastWaitErr = cmd.Wait()
+		waitDone := make(chan error, 1)
+		go func() {
+			waitDone <- cmd.Wait()
+		}()
+
+		if agyResultReceived {
+			// agy has already emitted the complete "result".
+			// Give it a brief grace period (500ms) to exit cleanly;
+			// if background tasks (MCP servers, language server, telemetry) linger,
+			// terminate the process group immediately so we don't stall the client.
+			select {
+			case err := <-waitDone:
+				lastWaitErr = err
+			case <-time.After(500 * time.Millisecond):
+				log.Printf("[Proxy] agy completed turn but lingered on shutdown; terminating process group (pid %d)", cmd.Process.Pid)
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				lastWaitErr = <-waitDone
+			}
+		} else {
+			lastWaitErr = <-waitDone
+		}
+
 		processExited.Store(true)
 		close(doneProcess)
 		stderrWg.Wait()
 		lastStderr = strings.TrimSpace(stderrBuf.String())
 
 		// If success or we got output, break retry loop
-		if lastWaitErr == nil || accumulatedText.Len() > 0 {
+		if lastWaitErr == nil || accumulatedText.Len() > 0 || agyResultReceived {
 			break
 		}
 		log.Printf("[Proxy] agy attempt %d failed (err=%v, stderr=%s)", attempt, lastWaitErr, lastStderr)
@@ -2129,7 +2178,7 @@ func handleStreamingCompletion(
 		}
 	}
 
-	if lastWaitErr != nil && accumulatedText.Len() == 0 {
+	if lastWaitErr != nil && !agyResultReceived && accumulatedText.Len() == 0 {
 		errDetails := lastStderr
 		if errDetails == "" {
 			errDetails = lastWaitErr.Error()
@@ -2344,7 +2393,7 @@ func handleStreamingCompletion(
 
 	writeSSE("data: [DONE]\n\n")
 
-	if !isAux && sessionKey != "" && activeConvID != "" && lastWaitErr == nil {
+	if !isAux && sessionKey != "" && activeConvID != "" && (lastWaitErr == nil || agyResultReceived || accumulatedText.Len() > 0) {
 		oldState := globalSessions.Get(sessionKey)
 		turns := 1
 		createdAt := time.Now()
