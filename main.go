@@ -1557,14 +1557,25 @@ func resolveModelAndEffort(rawModel, rawEffort string) (model string, effort str
 
 	if !found {
 		switch {
+		case strings.Contains(requested, "argon") || strings.Contains(requested, "gemini-4"):
+			selected, found = preferredCatalogModel("gemini-4-argon")
 		case strings.Contains(requested, "gemini-3.8") || strings.Contains(requested, "flash-3.8"):
 			selected, found = preferredCatalogModel("gemini-3.8-flash")
 		case strings.Contains(requested, "gemini-3.7") || strings.Contains(requested, "flash-3.7"):
 			selected, found = preferredCatalogModel("gemini-3.7-flash")
+			if !found {
+				selected, found = preferredCatalogModel("gemini-3.8-flash")
+			}
 		case strings.Contains(requested, "gemini-3.6") || strings.Contains(requested, "flash-3.6"):
 			selected, found = preferredCatalogModel("gemini-3.6-flash")
+			if !found {
+				selected, found = preferredCatalogModel("gemini-3.8-flash")
+			}
 		case strings.Contains(requested, "gemini") && strings.Contains(requested, "pro"):
 			selected, found = preferredCatalogModel("gemini-3.1-pro")
+			if !found {
+				selected, found = preferredCatalogModel("gemini-4-argon")
+			}
 		case strings.Contains(requested, "opus"):
 			selected, found = preferredCatalogModel("claude-opus")
 		case strings.Contains(requested, "sonnet") || strings.Contains(requested, "claude"):

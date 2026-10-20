@@ -149,6 +149,9 @@ func TestResolveModel(t *testing.T) {
 	registry.mu.Lock()
 	previous := registry.models
 	registry.models = []ModelItem{
+		{ID: "gemini-4-argon-high", Name: "Gemini 4 Argon (High)"},
+		{ID: "gemini-4-argon-medium", Name: "Gemini 4 Argon (Medium)"},
+		{ID: "gemini-4-argon-low", Name: "Gemini 4 Argon (Low)"},
 		{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High)"},
 		{ID: "gemini-3.8-flash-medium", Name: "Gemini 3.8 Flash (Medium)"},
 		{ID: "gemini-3.8-flash-low", Name: "Gemini 3.8 Flash (Low)"},
@@ -476,6 +479,30 @@ func TestSessionManager_LRUEviction(t *testing.T) {
 }
 
 func TestResolveModelAndEffort(t *testing.T) {
+	registry.mu.Lock()
+	previous := registry.models
+	registry.models = []ModelItem{
+		{ID: "gemini-4-argon-high", Name: "Gemini 4 Argon (High)"},
+		{ID: "gemini-4-argon-medium", Name: "Gemini 4 Argon (Medium)"},
+		{ID: "gemini-4-argon-low", Name: "Gemini 4 Argon (Low)"},
+		{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High)"},
+		{ID: "gemini-3.8-flash-medium", Name: "Gemini 3.8 Flash (Medium)"},
+		{ID: "gemini-3.8-flash-low", Name: "Gemini 3.8 Flash (Low)"},
+		{ID: "claude-opus-5-5-low", Name: "Claude Opus 5.5 (Low)"},
+		{ID: "claude-opus-5-5-medium", Name: "Claude Opus 5.5 (Medium)"},
+		{ID: "claude-opus-5-5-high", Name: "Claude Opus 5.5 (High)"},
+		{ID: "claude-sonnet-5-5-low", Name: "Claude Sonnet 5.5 (Low)"},
+		{ID: "claude-sonnet-5-5-medium", Name: "Claude Sonnet 5.5 (Medium)"},
+		{ID: "claude-sonnet-5-5-high", Name: "Claude Sonnet 5.5 (High)"},
+		{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B (Medium)"},
+	}
+	registry.mu.Unlock()
+	defer func() {
+		registry.mu.Lock()
+		registry.models = previous
+		registry.mu.Unlock()
+	}()
+
 	cases := []struct {
 		modelIn     string
 		effortIn    string
@@ -491,6 +518,9 @@ func TestResolveModelAndEffort(t *testing.T) {
 		{"claude-sonnet-5-5-high", "high", "claude-sonnet-5-5-high", "", false},
 		{"claude-opus-5-5-high", "medium", "claude-opus-5-5-high", "", false},
 		{"auto", "", "gemini-3.8-flash-high", "", false},
+		{"gemini-4-argon", "", "gemini-4-argon-high", "", false},
+		{"gemini-4-argon", "medium", "gemini-4-argon-medium", "", false},
+		{"gemini-3.7-flash", "", "gemini-3.8-flash-high", "", false},
 		{"nonexistent-xyz", "", "", "", true},
 	}
 
