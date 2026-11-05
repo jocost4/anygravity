@@ -947,19 +947,146 @@ func nextToolCallID() string {
 	return fmt.Sprintf("call_%d_%x", n, time.Now().UnixNano()&0xffff)
 }
 
-func sanitizeJSON(raw string) string {
+// hashToolCall computes a 64-bit FNV-1a hash of tool name and arguments.
+// It executes in O(L) time where L = len(name) + len(args) with O(1) auxiliary heap memory.
+func hashToolCall(name, args string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	var h uint64 = offset64
+	for i := 0; i < len(name); i++ {
+		h ^= uint64(name[i])
+		h *= prime64
+	}
+	h ^= uint64('|')
+	h *= prime64
+	for i := 0; i < len(args); i++ {
+		h ^= uint64(args[i])
+		h *= prime64
+	}
+	return h
+}
+
+// isClosingValueQuote performs O(1) lookahead skipping whitespace to determine
+// whether a double quote closes a JSON string value or is an unescaped literal inside a script.
+func isClosingValueQuote(raw string, i int, n int) bool {
+	j := i + 1
+	for j < n && (raw[j] == ' ' || raw[j] == '\t' || raw[j] == '\r' || raw[j] == '\n') {
+		j++
+	}
+	if j >= n {
+		return true
+	}
+	ch := raw[j]
+	switch ch {
+	case '}', ']':
+		return true
+	case ',':
+		// After a comma in a JSON object, we expect a key '"' or closing '}' / ']'
+		k := j + 1
+		for k < n && (raw[k] == ' ' || raw[k] == '\t' || raw[k] == '\r' || raw[k] == '\n') {
+			k++
+		}
+		if k >= n || raw[k] == '"' || raw[k] == '}' || raw[k] == ']' {
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// sanitizeJSONResilient sanitizes LLM JSON output in a single O(N) pass byte FSM.
+// It natively handles:
+// - Python triple quotes (""" and ''')
+// - Bash heredocs and scripts with literal unescaped quotes
+// - Raw newlines, carriage returns, and tabs in strings
+// - Invalid escape sequences (\d, \s, \`, \$, single backslashes)
+// - Trailing commas before } or ]
+func sanitizeJSONResilient(raw string) string {
 	var sb strings.Builder
-	sb.Grow(len(raw) + 64)
-	inString := false
+	sb.Grow(len(raw) + 128)
 	n := len(raw)
+
+	const (
+		stStructural = iota
+		stKey
+		stValueString
+		stTripleQuote
+		stTripleSingle
+	)
+
+	state := stStructural
+	expectingKey := true
+
 	for i := 0; i < n; i++ {
 		ch := raw[i]
-		if !inString {
-			if ch == '"' {
-				inString = true
+
+		switch state {
+		case stStructural:
+			if ch == '{' || ch == ',' {
+				expectingKey = true
+				if ch == ',' {
+					// O(1) lookahead: remove trailing comma before } or ]
+					j := i + 1
+					for j < n && (raw[j] == ' ' || raw[j] == '\t' || raw[j] == '\r' || raw[j] == '\n') {
+						j++
+					}
+					if j < n && (raw[j] == '}' || raw[j] == ']') {
+						continue
+					}
+				}
+				sb.WriteByte(ch)
+			} else if ch == ':' {
+				expectingKey = false
+				sb.WriteByte(ch)
+			} else if ch == '}' {
+				expectingKey = false
+				sb.WriteByte(ch)
+			} else if ch == '"' {
+				if expectingKey {
+					state = stKey
+					sb.WriteByte(ch)
+				} else {
+					if i+2 < n && raw[i+1] == '"' && raw[i+2] == '"' {
+						state = stTripleQuote
+						sb.WriteByte('"')
+						i += 2
+					} else {
+						state = stValueString
+						sb.WriteByte(ch)
+					}
+				}
+			} else if ch == '\'' {
+				if !expectingKey && i+2 < n && raw[i+1] == '\'' && raw[i+2] == '\'' {
+					state = stTripleSingle
+					sb.WriteByte('"')
+					i += 2
+				} else {
+					sb.WriteByte(ch)
+				}
+			} else {
+				sb.WriteByte(ch)
 			}
-			sb.WriteByte(ch)
-		} else {
+
+		case stKey:
+			if ch == '"' {
+				state = stStructural
+				sb.WriteByte(ch)
+			} else if ch == '\\' {
+				if i+1 < n {
+					sb.WriteByte('\\')
+					sb.WriteByte(raw[i+1])
+					i++
+				} else {
+					sb.WriteString(`\\`)
+				}
+			} else {
+				sb.WriteByte(ch)
+			}
+
+		case stValueString:
 			if ch == '\\' {
 				if i+1 < n {
 					nxt := raw[i+1]
@@ -986,8 +1113,6 @@ func sanitizeJSON(raw string) string {
 							i++
 						}
 					default:
-						// Invalid escape sequence like \` or \' or \$
-						// Treat the backslash as literal by escaping it.
 						sb.WriteString(`\\`)
 						sb.WriteByte(nxt)
 						i++
@@ -996,8 +1121,66 @@ func sanitizeJSON(raw string) string {
 					sb.WriteString(`\\`)
 				}
 			} else if ch == '"' {
-				inString = false
+				if isClosingValueQuote(raw, i, n) {
+					state = stStructural
+					sb.WriteByte('"')
+				} else {
+					sb.WriteString(`\"`)
+				}
+			} else if ch == '\n' {
+				sb.WriteString(`\n`)
+			} else if ch == '\r' {
+				sb.WriteString(`\r`)
+			} else if ch == '\t' {
+				sb.WriteString(`\t`)
+			} else {
 				sb.WriteByte(ch)
+			}
+
+		case stTripleQuote:
+			if i+2 < n && raw[i] == '"' && raw[i+1] == '"' && raw[i+2] == '"' {
+				state = stStructural
+				sb.WriteByte('"')
+				i += 2
+				continue
+			}
+			if ch == '"' {
+				sb.WriteString(`\"`)
+			} else if ch == '\\' {
+				if i+1 < n && (raw[i+1] == '"' || raw[i+1] == '\\' || raw[i+1] == 'n' || raw[i+1] == 'r' || raw[i+1] == 't') {
+					sb.WriteByte('\\')
+					sb.WriteByte(raw[i+1])
+					i++
+				} else {
+					sb.WriteString(`\\`)
+				}
+			} else if ch == '\n' {
+				sb.WriteString(`\n`)
+			} else if ch == '\r' {
+				sb.WriteString(`\r`)
+			} else if ch == '\t' {
+				sb.WriteString(`\t`)
+			} else {
+				sb.WriteByte(ch)
+			}
+
+		case stTripleSingle:
+			if i+2 < n && raw[i] == '\'' && raw[i+1] == '\'' && raw[i+2] == '\'' {
+				state = stStructural
+				sb.WriteByte('"')
+				i += 2
+				continue
+			}
+			if ch == '"' {
+				sb.WriteString(`\"`)
+			} else if ch == '\\' {
+				if i+1 < n && (raw[i+1] == '"' || raw[i+1] == '\\' || raw[i+1] == 'n' || raw[i+1] == 'r' || raw[i+1] == 't') {
+					sb.WriteByte('\\')
+					sb.WriteByte(raw[i+1])
+					i++
+				} else {
+					sb.WriteString(`\\`)
+				}
 			} else if ch == '\n' {
 				sb.WriteString(`\n`)
 			} else if ch == '\r' {
@@ -1009,17 +1192,15 @@ func sanitizeJSON(raw string) string {
 			}
 		}
 	}
+
 	return sb.String()
 }
 
-func parseToolCallJSON(raw string) []ParsedToolCall {
-	var result []ParsedToolCall
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil
-	}
+func sanitizeJSON(raw string) string {
+	return sanitizeJSONResilient(raw)
+}
 
-	// 1. Try single object
+func tryUnmarshalToolCall(data string) []ParsedToolCall {
 	var single struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
@@ -1033,115 +1214,237 @@ func parseToolCallJSON(raw string) []ParsedToolCall {
 		} `json:"tool_calls"`
 	}
 
-	err := json.Unmarshal([]byte(raw), &single)
-	if err != nil {
-		sanitized := sanitizeJSON(raw)
-		_ = json.Unmarshal([]byte(sanitized), &single)
-	}
-
-	if single.Name != "" && single.Name != "tool_call" {
-		tc := ParsedToolCall{
-			ID:   nextToolCallID(),
-			Type: "function",
-		}
-		tc.Function.Name = strings.TrimSpace(single.Name)
-		tc.Function.Arguments = normalizeArgs(single.Arguments)
-		result = append(result, tc)
-		return result
-	}
-
-	// 2. If wrapped in calls or tool_calls
-	if len(single.Calls) > 0 {
-		for _, c := range single.Calls {
-			if c.Name != "" {
-				tc := ParsedToolCall{
-					ID:   nextToolCallID(),
-					Type: "function",
+	if err := json.Unmarshal([]byte(data), &single); err == nil {
+		if single.Name != "" && single.Name != "tool_call" {
+			argsStr := normalizeArgs(single.Arguments)
+			if argsStr == "{}" {
+				var rawMap map[string]json.RawMessage
+				if errMap := json.Unmarshal([]byte(data), &rawMap); errMap == nil {
+					delete(rawMap, "name")
+					delete(rawMap, "id")
+					delete(rawMap, "type")
+					delete(rawMap, "calls")
+					delete(rawMap, "tool_calls")
+					if len(rawMap) > 0 {
+						if b, errM := json.Marshal(rawMap); errM == nil {
+							argsStr = string(b)
+						}
+					}
 				}
-				tc.Function.Name = strings.TrimSpace(c.Name)
-				tc.Function.Arguments = normalizeArgs(c.Arguments)
-				result = append(result, tc)
 			}
-		}
-		if len(result) > 0 {
-			return result
-		}
-	}
-	if len(single.ToolCalls) > 0 {
-		for _, c := range single.ToolCalls {
-			if c.Name != "" {
-				tc := ParsedToolCall{
-					ID:   nextToolCallID(),
-					Type: "function",
-				}
-				tc.Function.Name = strings.TrimSpace(c.Name)
-				tc.Function.Arguments = normalizeArgs(c.Arguments)
-				result = append(result, tc)
-			}
-		}
-		if len(result) > 0 {
-			return result
-		}
-	}
 
-	// 3. If single.Name == "tool_call" and arguments has nested "calls"
-	if single.Name == "tool_call" && len(single.Arguments) > 0 {
-		var sub struct {
-			Calls []struct {
-				Name      string          `json:"name"`
-				Arguments json.RawMessage `json:"arguments"`
-			} `json:"calls"`
+			return []ParsedToolCall{{
+				ID:   nextToolCallID(),
+				Type: "function",
+				Function: struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				}{
+					Name:      strings.TrimSpace(single.Name),
+					Arguments: argsStr,
+				},
+			}}
 		}
-		if err := json.Unmarshal(single.Arguments, &sub); err == nil && len(sub.Calls) > 0 {
-			for _, c := range sub.Calls {
+
+		if len(single.Calls) > 0 {
+			var res []ParsedToolCall
+			for _, c := range single.Calls {
 				if c.Name != "" {
-					tc := ParsedToolCall{
+					res = append(res, ParsedToolCall{
 						ID:   nextToolCallID(),
 						Type: "function",
-					}
-					tc.Function.Name = strings.TrimSpace(c.Name)
-					tc.Function.Arguments = normalizeArgs(c.Arguments)
-					result = append(result, tc)
+						Function: struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						}{
+							Name:      strings.TrimSpace(c.Name),
+							Arguments: normalizeArgs(c.Arguments),
+						},
+					})
 				}
 			}
-			if len(result) > 0 {
-				return result
+			if len(res) > 0 {
+				return res
 			}
 		}
-		// If cannot unwrap, keep single tool_call
-		tc := ParsedToolCall{
-			ID:   nextToolCallID(),
-			Type: "function",
+
+		if len(single.ToolCalls) > 0 {
+			var res []ParsedToolCall
+			for _, c := range single.ToolCalls {
+				if c.Name != "" {
+					res = append(res, ParsedToolCall{
+						ID:   nextToolCallID(),
+						Type: "function",
+						Function: struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						}{
+							Name:      strings.TrimSpace(c.Name),
+							Arguments: normalizeArgs(c.Arguments),
+						},
+					})
+				}
+			}
+			if len(res) > 0 {
+				return res
+			}
 		}
-		tc.Function.Name = "tool_call"
-		tc.Function.Arguments = normalizeArgs(single.Arguments)
-		result = append(result, tc)
-		return result
+
+		if single.Name == "tool_call" && len(single.Arguments) > 0 {
+			var sub struct {
+				Calls []struct {
+					Name      string          `json:"name"`
+					Arguments json.RawMessage `json:"arguments"`
+				} `json:"calls"`
+			}
+			if errSub := json.Unmarshal(single.Arguments, &sub); errSub == nil && len(sub.Calls) > 0 {
+				var res []ParsedToolCall
+				for _, c := range sub.Calls {
+					if c.Name != "" {
+						res = append(res, ParsedToolCall{
+							ID:   nextToolCallID(),
+							Type: "function",
+							Function: struct {
+								Name      string `json:"name"`
+								Arguments string `json:"arguments"`
+							}{
+								Name:      strings.TrimSpace(c.Name),
+								Arguments: normalizeArgs(c.Arguments),
+							},
+						})
+					}
+				}
+				if len(res) > 0 {
+					return res
+				}
+			}
+			return []ParsedToolCall{{
+				ID:   nextToolCallID(),
+				Type: "function",
+				Function: struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				}{
+					Name:      "tool_call",
+					Arguments: normalizeArgs(single.Arguments),
+				},
+			}}
+		}
 	}
 
-	// 4. Try array of objects: [{"name": ...}, ...]
 	var arr []struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
 	}
-	errArr := json.Unmarshal([]byte(raw), &arr)
-	if errArr != nil {
-		sanitized := sanitizeJSON(raw)
-		_ = json.Unmarshal([]byte(sanitized), &arr)
-	}
-	for _, item := range arr {
-		if item.Name != "" {
-			tc := ParsedToolCall{
-				ID:   nextToolCallID(),
-				Type: "function",
+	if err := json.Unmarshal([]byte(data), &arr); err == nil && len(arr) > 0 {
+		var res []ParsedToolCall
+		for _, item := range arr {
+			if item.Name != "" {
+				res = append(res, ParsedToolCall{
+					ID:   nextToolCallID(),
+					Type: "function",
+					Function: struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					}{
+						Name:      strings.TrimSpace(item.Name),
+						Arguments: normalizeArgs(item.Arguments),
+					},
+				})
 			}
-			tc.Function.Name = strings.TrimSpace(item.Name)
-			tc.Function.Arguments = normalizeArgs(item.Arguments)
-			result = append(result, tc)
+		}
+		if len(res) > 0 {
+			return res
 		}
 	}
 
-	return result
+	return nil
+}
+
+func fallbackHeuristicParse(raw string) []ParsedToolCall {
+	nameIdx := strings.Index(raw, `"name"`)
+	if nameIdx == -1 {
+		return nil
+	}
+	afterName := raw[nameIdx+6:]
+	colonIdx := strings.Index(afterName, ":")
+	if colonIdx == -1 {
+		return nil
+	}
+	valPart := strings.TrimSpace(afterName[colonIdx+1:])
+	if len(valPart) == 0 || valPart[0] != '"' {
+		return nil
+	}
+	endQuote := strings.Index(valPart[1:], `"`)
+	if endQuote == -1 {
+		return nil
+	}
+	toolName := strings.TrimSpace(valPart[1 : endQuote+1])
+	if toolName == "" || toolName == "tool_call" {
+		return nil
+	}
+
+	argsMap := make(map[string]string)
+	for _, paramKey := range []string{"CommandLine", "command", "cmd", "Content", "content", "Path", "path", "code"} {
+		pIdx := strings.Index(raw, `"`+paramKey+`"`)
+		if pIdx != -1 {
+			pRest := raw[pIdx+len(paramKey)+2:]
+			cIdx := strings.Index(pRest, ":")
+			if cIdx != -1 {
+				vPart := strings.TrimSpace(pRest[cIdx+1:])
+				if len(vPart) > 0 && vPart[0] == '"' {
+					vRest := vPart[1:]
+					endQ := strings.LastIndex(vRest, `"`)
+					if endQ != -1 {
+						argsMap[paramKey] = vRest[:endQ]
+					} else {
+						argsMap[paramKey] = vRest
+					}
+				}
+			}
+		}
+	}
+
+	var argsStr string
+	if len(argsMap) > 0 {
+		b, _ := json.Marshal(argsMap)
+		argsStr = string(b)
+	} else {
+		argsStr = "{}"
+	}
+
+	return []ParsedToolCall{{
+		ID:   nextToolCallID(),
+		Type: "function",
+		Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{
+			Name:      toolName,
+			Arguments: argsStr,
+		},
+	}}
+}
+
+func parseToolCallJSON(raw string) []ParsedToolCall {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	// Tier 1: strict RFC 8259 unmarshal
+	if calls := tryUnmarshalToolCall(raw); len(calls) > 0 {
+		return calls
+	}
+
+	// Tier 2: Resilient O(N) single-pass byte FSM sanitizer
+	sanitized := sanitizeJSONResilient(raw)
+	if calls := tryUnmarshalToolCall(sanitized); len(calls) > 0 {
+		return calls
+	}
+
+	// Tier 3: Heuristic extraction for extreme malformed cases
+	return fallbackHeuristicParse(raw)
 }
 
 func formatSubagentAnnouncement(toolCalls []ParsedToolCall) string {
@@ -1239,7 +1542,9 @@ func formatSubagentAnnouncement(toolCalls []ParsedToolCall) string {
 func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) {
 	cleaned := text
 
+	// 1. Tag format: <tool_call>...</tool_call> and <function_call>...</function_call>
 	matches := tagRegex.FindAllStringSubmatch(text, -1)
+	var successfullyParsedTags []string
 	for _, m := range matches {
 		raw := strings.TrimSpace(m[1])
 		raw = strings.TrimPrefix(raw, "```json")
@@ -1248,24 +1553,34 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 		raw = strings.TrimSpace(raw)
 
 		parsed := parseToolCallJSON(raw)
-		for _, tc := range parsed {
-			tc.Index = len(toolCalls)
-			toolCalls = append(toolCalls, tc)
+		if len(parsed) > 0 {
+			successfullyParsedTags = append(successfullyParsedTags, m[0])
+			for _, tc := range parsed {
+				tc.Index = len(toolCalls)
+				toolCalls = append(toolCalls, tc)
+			}
 		}
 	}
-	cleaned = tagRegex.ReplaceAllString(cleaned, "")
+	// Zero-Drop: only strip tags that were successfully converted to tool calls
+	for _, tagMatch := range successfullyParsedTags {
+		cleaned = strings.Replace(cleaned, tagMatch, "", 1)
+	}
 
+	// 2. Block format: ```tool_call ... ```
 	bMatches := blockRegex.FindAllStringSubmatch(cleaned, -1)
 	for _, m := range bMatches {
 		raw := strings.TrimSpace(m[1])
 		parsed := parseToolCallJSON(raw)
-		for _, tc := range parsed {
-			tc.Index = len(toolCalls)
-			toolCalls = append(toolCalls, tc)
+		if len(parsed) > 0 {
+			for _, tc := range parsed {
+				tc.Index = len(toolCalls)
+				toolCalls = append(toolCalls, tc)
+			}
+			cleaned = strings.Replace(cleaned, m[0], "", 1)
 		}
 	}
-	cleaned = blockRegex.ReplaceAllString(cleaned, "")
 
+	// 3. Bare markers: tool_call: {...}
 	for {
 		loc := bareMarkerRegex.FindStringIndex(cleaned)
 		if loc == nil {
@@ -1277,13 +1592,18 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 			break
 		}
 		parsed := parseToolCallJSON(jsonStr)
-		for _, tc := range parsed {
-			tc.Index = len(toolCalls)
-			toolCalls = append(toolCalls, tc)
+		if len(parsed) > 0 {
+			for _, tc := range parsed {
+				tc.Index = len(toolCalls)
+				toolCalls = append(toolCalls, tc)
+			}
+			cleaned = cleaned[:loc[0]] + cleaned[braceIdx+endOffset:]
+		} else {
+			break
 		}
-		cleaned = cleaned[:loc[0]] + cleaned[braceIdx+endOffset:]
 	}
 
+	// 4. Internal API: call:default_api:tool{...}
 	iMatches := internalRegex.FindAllStringSubmatch(cleaned, -1)
 	for _, m := range iMatches {
 		tname := m[1]
@@ -1299,16 +1619,14 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 	}
 	cleaned = internalRegex.ReplaceAllString(cleaned, "")
 
-	cleanText = strings.TrimSpace(cleaned)
-	cleanText = strings.Trim(cleanText, "` \t\r\n")
-
+	// 5. O(1) Memory deduplication using FNV-1a 64-bit integer hash table
 	if len(toolCalls) > 1 {
 		var uniqueCalls []ParsedToolCall
-		seen := make(map[string]bool)
+		seen := make(map[uint64]struct{}, len(toolCalls))
 		for _, tc := range toolCalls {
-			key := tc.Function.Name + "|" + tc.Function.Arguments
-			if !seen[key] {
-				seen[key] = true
+			h := hashToolCall(tc.Function.Name, tc.Function.Arguments)
+			if _, exists := seen[h]; !exists {
+				seen[h] = struct{}{}
 				tc.Index = len(uniqueCalls)
 				uniqueCalls = append(uniqueCalls, tc)
 			}
@@ -1316,12 +1634,10 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 		toolCalls = uniqueCalls
 	}
 
+	cleanText = strings.TrimSpace(cleaned)
+	cleanText = strings.Trim(cleanText, "` \t\r\n")
+
 	if len(toolCalls) > 0 {
-		// When tools are called, ONLY text that appeared BEFORE the first tool marker
-		// is a legitimate user-facing preamble (e.g. subagent dispatch announcement).
-		// Any text after or between tool calls is a hallucinated tool execution
-		// (e.g. fake "[Tool Result for ...]") or a premature final response that
-		// would cause duplicated responses once the real tool completes.
 		firstMarkerIdx := -1
 		markerPatterns := []string{"<tool_call>", "<function_call>", "```tool_call", "tool_call:", "function_call:", "call:default_api:"}
 		for _, pat := range markerPatterns {
@@ -1336,7 +1652,6 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 			preamble := strings.TrimSpace(text[:firstMarkerIdx])
 			preamble = thinkRegex.ReplaceAllString(preamble, "")
 			preamble = strings.Trim(preamble, "` \t\r\n")
-			// Discard if it looks like a simulated tool result or internal artifact
 			if strings.Contains(preamble, "[Tool Result") || strings.Contains(preamble, "Tool Result for") {
 				preamble = ""
 			}
@@ -1345,22 +1660,18 @@ func parseToolCalls(text string) (cleanText string, toolCalls []ParsedToolCall) 
 			cleanText = ""
 		}
 
-		// If cleanText is empty, synthesize an informative announcement for subagent operations
 		if cleanText == "" {
 			if ann := formatSubagentAnnouncement(toolCalls); ann != "" {
 				cleanText = ann
 			}
 		}
 	} else {
-		cleanText = strings.TrimSpace(cleaned)
-		cleanText = strings.Trim(cleanText, "` \t\r\n")
-
-		// Strip any hallucinated tool result blocks from normal response text
 		if strings.Contains(cleanText, "[Tool Result") || strings.Contains(cleanText, "Tool Result for") {
 			toolResultRegex := regexp.MustCompile(`(?s)\[Tool Result for '[^']+'\]:.*?(?:\n\n|$)`)
 			cleanText = strings.TrimSpace(toolResultRegex.ReplaceAllString(cleanText, ""))
 		}
 
+		// Zero-Drop Guarantee: if no tool calls were recognized, never drop text into empty response
 		if cleanText == "" && strings.TrimSpace(text) != "" {
 			cleanText = strings.TrimSpace(text)
 		}

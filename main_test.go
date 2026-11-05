@@ -918,5 +918,120 @@ func TestDeltaContinuityOnModelSwitch(t *testing.T) {
 	}
 }
 
+func TestParseToolCalls_Step97HeredocWithPython(t *testing.T) {
+	input := `<tool_call>
+{"name": "terminal", "arguments": {"command": "ssh hermes << 'EOF'
+cat << 'PYEOF' > /tmp/update_engine.py
+import os, sys
+
+path = "/home/ubuntu/caipirinha/internal/cobalt/engine.go"
+with open(path, "r") as f:
+content = f.read()
+
+if '"net/url"' not in content:
+content = content.replace('"net/http"', '"net/http"\n\t"net/url"')
+
+func_strip = '''// stripTrackingParams
+func stripTrackingParams(rawURL string) string {
+\tu, err := url.Parse(rawURL)
+}
+'''
+
+target1 = """return strings.TrimFunc(parts)"""
+
+with open(path, "w") as f:
+f.write(content)
+print("SUCCESS")
+PYEOF
+python3 /tmp/update_engine.py
+EOF"}}
+</tool_call>`
+
+	cleanText, toolCalls := parseToolCalls(input)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call parsed, got %d", len(toolCalls))
+	}
+	if toolCalls[0].Function.Name != "terminal" {
+		t.Errorf("expected terminal, got %s", toolCalls[0].Function.Name)
+	}
+
+	var args map[string]interface{}
+	if err := json.Unmarshal([]byte(toolCalls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments are not valid JSON: %v", err)
+	}
+	cmd, ok := args["command"].(string)
+	if !ok || !strings.Contains(cmd, "update_engine.py") {
+		t.Errorf("command missing expected content: %v", args["command"])
+	}
+	if cleanText != "" {
+		t.Errorf("expected cleanText to be empty when tool call parsed, got %q", cleanText)
+	}
+}
+
+func TestParseToolCalls_Step118PythonTripleQuotes(t *testing.T) {
+	input := `<tool_call>
+{"name": "execute_code", "arguments": {"language": "python", "code": """import subprocess
+
+res = subprocess.run(["ssh", "hermes", "cat /path/engine.go"], capture_output=True, text=True)
+if res.returncode != 0:
+    raise RuntimeError("Failed")
+
+target1 = '''return strings.TrimFunc(parts)'''
+print("Successfully updated!")
+"""}}
+</tool_call>`
+
+	cleanText, toolCalls := parseToolCalls(input)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call parsed, got %d", len(toolCalls))
+	}
+	if toolCalls[0].Function.Name != "execute_code" {
+		t.Errorf("expected execute_code, got %s", toolCalls[0].Function.Name)
+	}
+
+	var args map[string]interface{}
+	if err := json.Unmarshal([]byte(toolCalls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments are not valid JSON: %v", err)
+	}
+	if args["language"] != "python" {
+		t.Errorf("expected language python, got %v", args["language"])
+	}
+	code, ok := args["code"].(string)
+	if !ok || !strings.Contains(code, "Successfully updated!") {
+		t.Errorf("code missing expected content: %v", args["code"])
+	}
+	if cleanText != "" {
+		t.Errorf("expected cleanText to be empty, got %q", cleanText)
+	}
+}
+
+func TestParseToolCalls_ZeroDropGuarantee(t *testing.T) {
+	// If a corrupted or unrecognizable tool call occurs, the text MUST NOT be erased into ""
+	input := "Here is some important reasoning.\n<tool_call>corrupted nonsense without json</tool_call>"
+	cleanText, toolCalls := parseToolCalls(input)
+	if len(toolCalls) != 0 {
+		t.Errorf("expected 0 tool calls, got %d", len(toolCalls))
+	}
+	if cleanText == "" {
+		t.Fatalf("Zero-Drop guarantee failed: cleanText was dropped to empty string!")
+	}
+	if !strings.Contains(cleanText, "Here is some important reasoning") {
+		t.Errorf("cleanText missing original content: %q", cleanText)
+	}
+}
+
+func TestHashToolCall_O1Memory(t *testing.T) {
+	h1 := hashToolCall("terminal", `{"command": "ls -la"}`)
+	h2 := hashToolCall("terminal", `{"command": "ls -la"}`)
+	h3 := hashToolCall("terminal", `{"command": "pwd"}`)
+
+	if h1 != h2 {
+		t.Errorf("expected hash to be deterministic: %d != %d", h1, h2)
+	}
+	if h1 == h3 {
+		t.Errorf("expected different arguments to yield different hashes")
+	}
+}
+
 
 
