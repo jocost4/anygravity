@@ -4448,6 +4448,7 @@ func main() {
 	mux.HandleFunc("GET /v1/models/", handleModelInfo)
 	mux.HandleFunc("POST /v1/chat/completions", handleChatCompletions)
 	mux.HandleFunc("POST /v1/messages", handleAnthropicMessages)
+	mux.HandleFunc("POST /messages", handleAnthropicMessages)
 	mux.HandleFunc("POST /api/show", handleOllamaShow)
 	mux.HandleFunc("GET /api/tags", handleOllamaTags)
 
