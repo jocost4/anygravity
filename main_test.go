@@ -1033,5 +1033,153 @@ func TestHashToolCall_O1Memory(t *testing.T) {
 	}
 }
 
+func TestAnthropicConvert_TextAndSystem(t *testing.T) {
+	req := AnthropicMessagesRequest{
+		Model:  "claude-3-7-sonnet",
+		System: json.RawMessage(`"You are a helpful coding assistant."`),
+		Messages: []AnthropicMessage{
+			{
+				Role:    "user",
+				Content: json.RawMessage(`"Hello Antigravity!"`),
+			},
+		},
+	}
+
+	msgs, tools, err := convertAnthropicToInternal(req)
+	if err != nil {
+		t.Fatalf("unexpected convert error: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages (system + user), got %d", len(msgs))
+	}
+	if msgs[0].Role != "system" || !strings.Contains(msgs[0].ContentString(), "coding assistant") {
+		t.Errorf("system message mismatch: %v", msgs[0])
+	}
+	if msgs[1].Role != "user" || !strings.Contains(msgs[1].ContentString(), "Hello Antigravity!") {
+		t.Errorf("user message mismatch: %v", msgs[1])
+	}
+	if len(tools) != 0 {
+		t.Errorf("expected 0 tools, got %d", len(tools))
+	}
+}
+
+func TestAnthropicConvert_ToolUseAndToolResult(t *testing.T) {
+	req := AnthropicMessagesRequest{
+		Model: "gemini-3.8-flash",
+		Messages: []AnthropicMessage{
+			{
+				Role: "assistant",
+				Content: json.RawMessage(`[
+					{"type": "text", "text": "I will list the directory."},
+					{"type": "tool_use", "id": "call_abc123", "name": "bash", "input": {"command": "ls -la"}}
+				]`),
+			},
+			{
+				Role: "user",
+				Content: json.RawMessage(`[
+					{"type": "tool_result", "tool_use_id": "call_abc123", "content": "file1.txt\nfile2.txt"}
+				]`),
+			},
+		},
+		Tools: []AnthropicTool{
+			{
+				Name:        "bash",
+				Description: "Run bash command",
+				InputSchema: json.RawMessage(`{"type": "object", "properties": {"command": {"type": "string"}}}`),
+			},
+		},
+	}
+
+	msgs, tools, err := convertAnthropicToInternal(req)
+	if err != nil {
+		t.Fatalf("unexpected error converting: %v", err)
+	}
+
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(tools))
+	}
+	if tools[0].Function.Name != "bash" {
+		t.Errorf("expected tool name bash, got %s", tools[0].Function.Name)
+	}
+
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 converted messages, got %d", len(msgs))
+	}
+
+	// Message 0: Assistant with tool call
+	asstMsg := msgs[0]
+	if asstMsg.Role != "assistant" {
+		t.Errorf("expected role assistant, got %s", asstMsg.Role)
+	}
+	var calls []ParsedToolCall
+	if err := json.Unmarshal(asstMsg.ToolCalls, &calls); err != nil {
+		t.Fatalf("failed to unmarshal assistant tool calls: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 tool call in assistant message, got %d", len(calls))
+	}
+	tc := calls[0]
+	if tc.ID != "call_abc123" {
+		t.Errorf("expected tool call id call_abc123, got %s", tc.ID)
+	}
+	if tc.Function.Name != "bash" {
+		t.Errorf("expected tool name bash, got %s", tc.Function.Name)
+	}
+	if !strings.Contains(tc.Function.Arguments, "ls -la") {
+		t.Errorf("arguments missing ls -la: %s", tc.Function.Arguments)
+	}
+
+	// Message 1: Tool result
+	toolMsg := msgs[1]
+	if toolMsg.Role != "tool" {
+		t.Errorf("expected role tool, got %s", toolMsg.Role)
+	}
+	if toolMsg.ToolCallID != "call_abc123" {
+		t.Errorf("expected tool_call_id call_abc123, got %s", toolMsg.ToolCallID)
+	}
+	if !strings.Contains(toolMsg.ContentString(), "file1.txt") {
+		t.Errorf("expected tool content to contain file1.txt, got %s", toolMsg.ContentString())
+	}
+}
+
+func TestAnthropicMessages_CORSAndAuth(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/messages", handleAnthropicMessages)
+
+	os.Setenv("ANYGRAVITY_API_KEY", "secret-key-42")
+	defer os.Unsetenv("ANYGRAVITY_API_KEY")
+
+	handler := authMiddleware(mux)
+
+	// 1. CORS Preflight OPTIONS
+	reqOpt := httptest.NewRequest("OPTIONS", "/v1/messages", nil)
+	wOpt := httptest.NewRecorder()
+	handler.ServeHTTP(wOpt, reqOpt)
+	if wOpt.Code != http.StatusOK {
+		t.Errorf("expected OPTIONS 200 OK, got %d", wOpt.Code)
+	}
+	if wOpt.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("missing CORS Allow-Origin header")
+	}
+
+	// 2. Request without auth -> 401
+	reqNoAuth := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{}`))
+	wNoAuth := httptest.NewRecorder()
+	handler.ServeHTTP(wNoAuth, reqNoAuth)
+	if wNoAuth.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized, got %d", wNoAuth.Code)
+	}
+
+	// 3. Request with X-Api-Key
+	reqWithKey := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"invalid-model-for-test"}`))
+	reqWithKey.Header.Set("X-Api-Key", "secret-key-42")
+	wWithKey := httptest.NewRecorder()
+	handler.ServeHTTP(wWithKey, reqWithKey)
+	// Even if model is invalid, it passes auth middleware (code should not be 401)
+	if wWithKey.Code == http.StatusUnauthorized {
+		t.Errorf("expected X-Api-Key to pass authentication, but got 401")
+	}
+}
+
 
 

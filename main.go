@@ -587,6 +587,162 @@ func (m *ChatMessage) ContentString() string {
 	return string(m.Content)
 }
 
+// -----------------------------------------------------------------------------
+// Anthropic Messages API Types & Converters
+// -----------------------------------------------------------------------------
+type AnthropicContentBlock struct {
+	Type      string          `json:"type"`                  // "text", "tool_use", "tool_result", "thinking"
+	Text      string          `json:"text,omitempty"`
+	ID        string          `json:"id,omitempty"`          // for tool_use
+	Name      string          `json:"name,omitempty"`        // for tool_use
+	Input     json.RawMessage `json:"input,omitempty"`       // for tool_use (JSON object)
+	ToolUseID string          `json:"tool_use_id,omitempty"` // for tool_result
+	Content   json.RawMessage `json:"content,omitempty"`     // for tool_result (string or blocks)
+	IsError   bool            `json:"is_error,omitempty"`    // for tool_result
+}
+
+type AnthropicMessage struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"` // string or []AnthropicContentBlock
+}
+
+type AnthropicTool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema"`
+}
+
+type AnthropicMessagesRequest struct {
+	Model           string             `json:"model"`
+	Messages        []AnthropicMessage `json:"messages"`
+	System          json.RawMessage    `json:"system,omitempty"` // string or []AnthropicContentBlock
+	Tools           []AnthropicTool    `json:"tools,omitempty"`
+	Stream          bool               `json:"stream,omitempty"`
+	MaxTokens       int                `json:"max_tokens,omitempty"`
+	Temperature     *float64           `json:"temperature,omitempty"`
+	ReasoningEffort string             `json:"reasoning_effort,omitempty"`
+}
+
+func convertAnthropicToInternal(req AnthropicMessagesRequest) ([]ChatMessage, []ToolItem, error) {
+	var messages []ChatMessage
+
+	// 1. System Prompt
+	if len(req.System) > 0 {
+		var sysStr string
+		if err := json.Unmarshal(req.System, &sysStr); err == nil {
+			if strings.TrimSpace(sysStr) != "" {
+				b, _ := json.Marshal(sysStr)
+				messages = append(messages, ChatMessage{Role: "system", Content: b})
+			}
+		} else {
+			var sysBlocks []AnthropicContentBlock
+			if errBlocks := json.Unmarshal(req.System, &sysBlocks); errBlocks == nil {
+				var sb strings.Builder
+				for _, b := range sysBlocks {
+					if b.Text != "" {
+						sb.WriteString(b.Text)
+						sb.WriteString("\n")
+					}
+				}
+				if txt := strings.TrimSpace(sb.String()); txt != "" {
+					b, _ := json.Marshal(txt)
+					messages = append(messages, ChatMessage{Role: "system", Content: b})
+				}
+			}
+		}
+	}
+
+	// 2. Messages
+	for _, m := range req.Messages {
+		var contentStr string
+		if err := json.Unmarshal(m.Content, &contentStr); err == nil {
+			messages = append(messages, ChatMessage{
+				Role:    m.Role,
+				Content: m.Content,
+			})
+			continue
+		}
+
+		var blocks []AnthropicContentBlock
+		if err := json.Unmarshal(m.Content, &blocks); err == nil {
+			var textParts []string
+			var toolCalls []map[string]interface{}
+
+			for _, b := range blocks {
+				switch b.Type {
+				case "text":
+					if b.Text != "" {
+						textParts = append(textParts, b.Text)
+					}
+				case "tool_use":
+					tc := map[string]interface{}{
+						"id":   b.ID,
+						"type": "function",
+						"function": map[string]interface{}{
+							"name":      b.Name,
+							"arguments": string(b.Input),
+						},
+					}
+					toolCalls = append(toolCalls, tc)
+				case "tool_result":
+					var resText string
+					if errC := json.Unmarshal(b.Content, &resText); errC == nil {
+						// plain string
+					} else {
+						var subBlocks []AnthropicContentBlock
+						if errSB := json.Unmarshal(b.Content, &subBlocks); errSB == nil {
+							var sb strings.Builder
+							for _, sbBlock := range subBlocks {
+								if sbBlock.Text != "" {
+									sb.WriteString(sbBlock.Text)
+									sb.WriteString("\n")
+								}
+							}
+							resText = strings.TrimSpace(sb.String())
+						} else {
+							resText = string(b.Content)
+						}
+					}
+					resB, _ := json.Marshal(resText)
+					messages = append(messages, ChatMessage{
+						Role:       "tool",
+						ToolCallID: b.ToolUseID,
+						Content:    resB,
+					})
+				}
+			}
+
+			if len(textParts) > 0 || len(toolCalls) > 0 {
+				joinedText := strings.Join(textParts, "\n\n")
+				tb, _ := json.Marshal(joinedText)
+				cm := ChatMessage{
+					Role:    m.Role,
+					Content: tb,
+				}
+				if len(toolCalls) > 0 {
+					tcb, _ := json.Marshal(toolCalls)
+					cm.ToolCalls = tcb
+				}
+				messages = append(messages, cm)
+			}
+		}
+	}
+
+	// 3. Tools
+	var tools []ToolItem
+	for _, t := range req.Tools {
+		ti := ToolItem{
+			Type: "function",
+		}
+		ti.Function.Name = t.Name
+		ti.Function.Description = t.Description
+		ti.Function.Parameters = t.InputSchema
+		tools = append(tools, ti)
+	}
+
+	return messages, tools, nil
+}
+
 func formatToolsPrompt(tools []ToolItem) string {
 	if len(tools) == 0 {
 		return ""
@@ -3254,6 +3410,932 @@ func handleNonStreamingCompletion(
 }
 
 // -----------------------------------------------------------------------------
+// Anthropic Messages API Handlers
+// -----------------------------------------------------------------------------
+func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
+	reqCount.Add(1)
+
+	var req AnthropicMessagesRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"type": "error",
+				"error": map[string]string{
+					"type":    "invalid_request_error",
+					"message": "Request payload too large (max 10MB)",
+				},
+			})
+			return
+		}
+		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"type": "error",
+			"error": map[string]string{
+				"type":    "invalid_request_error",
+				"message": fmt.Sprintf("Failed to parse Anthropic JSON: %v", err),
+			},
+		})
+		return
+	}
+
+	messages, tools, err := convertAnthropicToInternal(req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"type": "error",
+			"error": map[string]string{
+				"type":    "invalid_request_error",
+				"message": fmt.Sprintf("Failed to convert Anthropic messages: %v", err),
+			},
+		})
+		return
+	}
+
+	requestedModel := req.Model
+	model, effort, err := resolveModelAndEffort(requestedModel, req.ReasoningEffort)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"type": "error",
+			"error": map[string]string{
+				"type":    "invalid_request_error",
+				"message": err.Error(),
+			},
+		})
+		return
+	}
+
+	sessionKey, isAux := extractSessionKey(messages, tools, r.Header)
+	activeState := globalSessions.Get(sessionKey)
+
+	toolsPrompt := formatToolsPrompt(tools)
+	fallbackFullPrompt := formatConversation(messages, toolsPrompt)
+
+	toolsHash := hashTools(tools)
+	currentHashes := make([]string, len(messages))
+	for i, m := range messages {
+		currentHashes[i] = hashMessage(m)
+	}
+
+	var finalPrompt string
+	var convID string
+	var isDelta bool
+
+	if activeState != nil && activeState.ConvID != "" && activeState.ToolsHash == toolsHash {
+		if len(messages) > activeState.MessageCount {
+			prefixOK := true
+			if len(activeState.HistoryHashes) < activeState.MessageCount || len(currentHashes) < activeState.MessageCount {
+				prefixOK = false
+			} else {
+				for i := 0; i < activeState.MessageCount; i++ {
+					if currentHashes[i] != activeState.HistoryHashes[i] {
+						prefixOK = false
+						break
+					}
+				}
+			}
+
+			if prefixOK {
+				finalPrompt = formatDeltaPrompt(messages, activeState.MessageCount)
+				convID = activeState.ConvID
+				isDelta = true
+				if activeState.Model != model {
+					log.Printf("[Anthropic-Delta] Session %s continuing conv %s with switched model: %s -> %s: delta (%d chars) for msgs %d..%d",
+						sessionKey, convID, activeState.Model, model, len(finalPrompt), activeState.MessageCount, len(messages))
+				} else {
+					log.Printf("[Anthropic-Delta] Session %s continuing conv %s: delta (%d chars) for msgs %d..%d",
+						sessionKey, convID, len(finalPrompt), activeState.MessageCount, len(messages))
+				}
+			} else {
+				log.Printf("[Anthropic-Delta] Desync detected for session %s (prefix changed). Re-anchoring.", sessionKey)
+				globalSessions.Invalidate(sessionKey)
+			}
+		} else if len(messages) == activeState.MessageCount && activeState.MessageCount > 0 {
+			prefixOK := true
+			if len(activeState.HistoryHashes) < activeState.MessageCount || len(currentHashes) < activeState.MessageCount {
+				prefixOK = false
+			} else {
+				for i := 0; i < activeState.MessageCount-1; i++ {
+					if currentHashes[i] != activeState.HistoryHashes[i] {
+						prefixOK = false
+						break
+					}
+				}
+			}
+			if prefixOK {
+				finalPrompt = formatDeltaPrompt(messages, activeState.MessageCount-1)
+				convID = activeState.ConvID
+				isDelta = true
+				if activeState.Model != model {
+					log.Printf("[Anthropic-Delta] Session %s reprompt on conv %s with switched model: %s -> %s: delta (%d chars) for msg %d",
+						sessionKey, convID, activeState.Model, model, len(finalPrompt), activeState.MessageCount-1)
+				} else {
+					log.Printf("[Anthropic-Delta] Session %s reprompt on same conv %s: delta (%d chars) for msg %d",
+						sessionKey, convID, len(finalPrompt), activeState.MessageCount-1)
+				}
+			}
+		} else if len(messages) < activeState.MessageCount {
+			log.Printf("[Anthropic-Delta] History truncation/compaction detected for session %s. Re-anchoring.", sessionKey)
+			globalSessions.Invalidate(sessionKey)
+		}
+	}
+
+	if !isDelta {
+		finalPrompt = fallbackFullPrompt
+		log.Printf("[Anthropic-Full] Starting anchor prompt for session %s (aux=%v, msgs=%d, chars=%d)",
+			sessionKey, isAux, len(messages), len(finalPrompt))
+	}
+
+	lastMsgSummary := ""
+	if len(messages) > 0 {
+		lastMsg := messages[len(messages)-1]
+		contentStr := lastMsg.ContentString()
+		limit := len(contentStr)
+		if limit > 80 {
+			limit = 80
+		}
+		lastMsgSummary = fmt.Sprintf("role=%s len=%d content=%q", lastMsg.Role, len(contentStr), contentStr[:limit])
+	}
+	log.Printf("[Anthropic] Request #%d: model=%s (orig: %s) delta=%v stream=%v msgs=%d tools=%d promptLen=%d last=[%s]",
+		reqCount.Load(), model, req.Model, isDelta, req.Stream, len(messages), len(tools), len(finalPrompt), lastMsgSummary)
+
+	createdTs := time.Now().Unix()
+	completionID := fmt.Sprintf("msg-agy-%d", createdTs)
+
+	args := []string{
+		"--disable-slash-commands",
+		"--dangerously-skip-permissions",
+	}
+
+	if req.Stream {
+		args = append(args, "--output-format", "stream-json")
+	} else {
+		args = append(args, "--output-format", "json")
+	}
+
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	if effort != "" {
+		args = append(args, "--effort", effort)
+	}
+	if convID != "" {
+		args = append(args, "--conversation", convID)
+	}
+
+	totalPromptChars := 0
+	for _, m := range messages {
+		totalPromptChars += len(m.Role) + len(m.Content) + len(m.Name) + len(m.ToolCalls)
+	}
+	for _, t := range tools {
+		totalPromptChars += len(t.Type) + len(t.Function.Name) + len(t.Function.Description) + len(t.Function.Parameters)
+	}
+	promptTokens := totalPromptChars / 4
+	if promptTokens < 1 {
+		promptTokens = len(finalPrompt) / 4
+	}
+	if promptTokens < 1 {
+		promptTokens = 1
+	}
+
+	if req.Stream {
+		handleStreamingAnthropicMessages(w, r, args, completionID, model, createdTs, sessionKey, isAux, isDelta, convID, finalPrompt, fallbackFullPrompt, currentHashes, toolsHash, len(tools) > 0, promptTokens)
+	} else {
+		handleNonStreamingAnthropicMessages(w, r, args, completionID, model, createdTs, sessionKey, isAux, isDelta, convID, finalPrompt, fallbackFullPrompt, currentHashes, toolsHash, promptTokens)
+	}
+}
+
+func handleStreamingAnthropicMessages(
+	w http.ResponseWriter,
+	r *http.Request,
+	args []string,
+	completionID, model string,
+	createdTs int64,
+	sessionKey string,
+	isAux, isDelta bool,
+	initialConvID, finalPrompt, fallbackFullPrompt string,
+	currentHashes []string,
+	toolsHash string,
+	hasTools bool,
+	promptTokens int,
+) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("anthropic-version", "2023-06-01")
+
+	var writeMu sync.Mutex
+	var lastWrite atomic.Int64
+	lastWrite.Store(time.Now().Unix())
+
+	writeSSE := func(event, data string) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		lastWrite.Store(time.Now().Unix())
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+		flusher.Flush()
+	}
+
+	emitErrorSSE := func(msg string) {
+		errObj := map[string]interface{}{
+			"type": "error",
+			"error": map[string]string{
+				"type":    "api_error",
+				"message": msg,
+			},
+		}
+		b, _ := json.Marshal(errObj)
+		writeSSE("error", string(b))
+	}
+
+	// 1. Send message_start event
+	startMsg := map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id":            completionID,
+			"type":          "message",
+			"role":          "assistant",
+			"model":         model,
+			"content":       []interface{}{},
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage": map[string]interface{}{
+				"input_tokens":  promptTokens,
+				"output_tokens": 1,
+			},
+		},
+	}
+	sb, _ := json.Marshal(startMsg)
+	writeSSE("message_start", string(sb))
+
+	ctx := r.Context()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	go func() {
+		defer func() { _ = recover() }()
+		for {
+			select {
+			case <-ticker.C:
+				if time.Now().Unix()-lastWrite.Load() >= 10 {
+					writeMu.Lock()
+					fmt.Fprintf(w, ": ping\n\n")
+					flusher.Flush()
+					writeMu.Unlock()
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	var accumulatedText strings.Builder
+	var streamedText strings.Builder
+	var streamPending strings.Builder
+	activeConvID := initialConvID
+	isBufferingTool := false
+	var lastWaitErr error
+	var lastStderr string
+	var agyResultReceived bool
+	currentBlockIdx := 0
+	textBlockStarted := false
+
+	emitTextDelta := func(text string) {
+		if text == "" {
+			return
+		}
+		if !textBlockStarted {
+			textBlockStarted = true
+			startBlock := map[string]interface{}{
+				"type":  "content_block_start",
+				"index": currentBlockIdx,
+				"content_block": map[string]interface{}{
+					"type": "text",
+					"text": "",
+				},
+			}
+			b, _ := json.Marshal(startBlock)
+			writeSSE("content_block_start", string(b))
+		}
+		deltaChunk := map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": currentBlockIdx,
+			"delta": map[string]interface{}{
+				"type": "text_delta",
+				"text": text,
+			},
+		}
+		b, _ := json.Marshal(deltaChunk)
+		writeSSE("content_block_delta", string(b))
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if attempt > 1 {
+			log.Printf("[Anthropic-Proxy] Retrying agy (attempt %d/2) for %s...", attempt, completionID)
+			accumulatedText.Reset()
+			streamedText.Reset()
+			streamPending.Reset()
+			isBufferingTool = false
+			agyResultReceived = false
+			time.Sleep(500 * time.Millisecond)
+
+			if isDelta {
+				if ctx.Err() != nil {
+					return
+				}
+				if sessionKey != "" {
+					globalSessions.Invalidate(sessionKey)
+				}
+				var filteredArgs []string
+				for idx := 0; idx < len(args); idx++ {
+					if args[idx] == "--conversation" {
+						idx++
+						continue
+					}
+					filteredArgs = append(filteredArgs, args[idx])
+				}
+				args = filteredArgs
+				finalPrompt = fallbackFullPrompt
+				isDelta = false
+				activeConvID = ""
+			}
+		}
+
+		cmd := exec.CommandContext(ctx, agyBin, args...)
+		cmd.Dir = workspaceDir
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Env = append(os.Environ(), "PATH="+filepath.Join(os.Getenv("HOME"), ".local/bin")+":"+os.Getenv("PATH"))
+
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			emitErrorSSE(fmt.Sprintf("StdinPipe error: %v", err))
+			return
+		}
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			emitErrorSSE(fmt.Sprintf("StdoutPipe error: %v", err))
+			return
+		}
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			emitErrorSSE(fmt.Sprintf("StderrPipe error: %v", err))
+			return
+		}
+
+		var stderrBuf bytes.Buffer
+		var stderrWg sync.WaitGroup
+		stderrWg.Add(1)
+		go func() {
+			defer stderrWg.Done()
+			_, _ = io.Copy(&stderrBuf, stderr)
+		}()
+
+		if err := cmd.Start(); err != nil {
+			lastWaitErr = err
+			lastStderr = fmt.Sprintf("cmd.Start: %v", err)
+			continue
+		}
+
+		var processExited atomic.Bool
+		doneProcess := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				if !processExited.Load() && cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+			case <-doneProcess:
+			}
+		}()
+
+		go func() {
+			defer stdin.Close()
+			_, _ = io.WriteString(stdin, finalPrompt)
+		}()
+
+		reader := bufio.NewReader(stdout)
+		for {
+			line, err := reader.ReadBytes('\n')
+			if len(line) > 0 {
+				lineStr := strings.TrimRight(string(line), "\r\n")
+				if lineStr == "" {
+					continue
+				}
+
+				var event struct {
+					Event          string `json:"event"`
+					ConversationID string `json:"conversation_id"`
+					StepUpdate     struct {
+						TextDelta string `json:"text_delta"`
+					} `json:"step_update"`
+					Result struct {
+						ConversationID string `json:"conversation_id"`
+						Status         string `json:"status"`
+						Response       string `json:"response"`
+					} `json:"result"`
+				}
+				if errJ := json.Unmarshal([]byte(lineStr), &event); errJ == nil {
+					if event.Event == "init" && event.ConversationID != "" {
+						activeConvID = event.ConversationID
+					} else if event.Event == "result" {
+						if event.Result.ConversationID != "" {
+							activeConvID = event.Result.ConversationID
+						} else if event.ConversationID != "" {
+							activeConvID = event.ConversationID
+						}
+						if accumulatedText.Len() == 0 && event.Result.Response != "" {
+							accumulatedText.WriteString(event.Result.Response)
+						}
+						agyResultReceived = true
+						break
+					} else if event.Event == "step_update" {
+						delta := event.StepUpdate.TextDelta
+						if delta != "" {
+							accumulatedText.WriteString(delta)
+							if !isBufferingTool {
+								streamPending.WriteString(delta)
+								pending := streamPending.String()
+
+								markers := []string{"<tool_call>", "<function_call>", "call:default_api:", "```tool_call"}
+								toolMarkerIdx := -1
+								for _, m := range markers {
+									if idx := strings.Index(pending, m); idx != -1 {
+										if toolMarkerIdx == -1 || idx < toolMarkerIdx {
+											toolMarkerIdx = idx
+										}
+									}
+								}
+
+								if toolMarkerIdx != -1 {
+									toEmit := pending[:toolMarkerIdx]
+									if toEmit != "" {
+										streamedText.WriteString(toEmit)
+										emitTextDelta(toEmit)
+									}
+									isBufferingTool = true
+									streamPending.Reset()
+								} else {
+									splitIdx := len(pending)
+									const maxMarkerLen = 16
+									maxK := len(pending)
+									if maxK > maxMarkerLen {
+										maxK = maxMarkerLen
+									}
+									foundPrefix := false
+									for k := maxK; k > 0; k-- {
+										suffix := pending[len(pending)-k:]
+										for _, m := range markers {
+											if strings.HasPrefix(m, suffix) {
+												splitIdx = len(pending) - k
+												foundPrefix = true
+												break
+											}
+										}
+										if foundPrefix {
+											break
+										}
+									}
+
+									toEmit := pending[:splitIdx]
+									toHold := pending[splitIdx:]
+									if toEmit != "" {
+										streamedText.WriteString(toEmit)
+										emitTextDelta(toEmit)
+									}
+									streamPending.Reset()
+									streamPending.WriteString(toHold)
+								}
+							}
+						}
+					}
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+
+		if !isBufferingTool && streamPending.Len() > 0 {
+			rem := streamPending.String()
+			streamedText.WriteString(rem)
+			emitTextDelta(rem)
+			streamPending.Reset()
+		}
+
+		waitDone := make(chan error, 1)
+		go func() { waitDone <- cmd.Wait() }()
+
+		if agyResultReceived {
+			select {
+			case err := <-waitDone:
+				lastWaitErr = err
+			case <-time.After(500 * time.Millisecond):
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				lastWaitErr = <-waitDone
+			}
+		} else {
+			lastWaitErr = <-waitDone
+		}
+
+		processExited.Store(true)
+		close(doneProcess)
+		stderrWg.Wait()
+		lastStderr = strings.TrimSpace(stderrBuf.String())
+
+		if lastWaitErr == nil || accumulatedText.Len() > 0 || agyResultReceived {
+			break
+		}
+	}
+
+	if lastWaitErr != nil && !agyResultReceived && accumulatedText.Len() == 0 {
+		errDetails := lastStderr
+		if errDetails == "" {
+			errDetails = lastWaitErr.Error()
+		}
+		emitErrorSSE(errDetails)
+		return
+	}
+
+	fullOutput := accumulatedText.String()
+	cleanText, toolCalls := parseToolCalls(fullOutput)
+
+	reasoning := ""
+	if activeConvID != "" {
+		reasoning = extractReasoningFromTranscript(activeConvID)
+	}
+
+	// 2. Emit thinking block if present and text has not yet started
+	if reasoning != "" && !textBlockStarted {
+		thStart := map[string]interface{}{
+			"type":  "content_block_start",
+			"index": currentBlockIdx,
+			"content_block": map[string]interface{}{
+				"type":     "thinking",
+				"thinking": "",
+			},
+		}
+		b, _ := json.Marshal(thStart)
+		writeSSE("content_block_start", string(b))
+
+		thDelta := map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": currentBlockIdx,
+			"delta": map[string]interface{}{
+				"type":     "thinking_delta",
+				"thinking": reasoning,
+			},
+		}
+		b, _ = json.Marshal(thDelta)
+		writeSSE("content_block_delta", string(b))
+
+		thStop := map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": currentBlockIdx,
+		}
+		b, _ = json.Marshal(thStop)
+		writeSSE("content_block_stop", string(b))
+		currentBlockIdx++
+	}
+
+	// 3. Emit remaining text if not yet streamed
+	unstreamed := ""
+	alreadyStreamed := streamedText.String()
+	if alreadyStreamed == "" {
+		unstreamed = cleanText
+	} else if strings.HasPrefix(cleanText, alreadyStreamed) {
+		unstreamed = cleanText[len(alreadyStreamed):]
+	} else if trimmedStreamed := strings.TrimRight(alreadyStreamed, " \t\r\n"); strings.HasPrefix(cleanText, trimmedStreamed) {
+		unstreamed = strings.TrimPrefix(cleanText, trimmedStreamed)
+	}
+
+	if unstreamed != "" {
+		emitTextDelta(unstreamed)
+	}
+
+	if textBlockStarted {
+		stopBlock := map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": currentBlockIdx,
+		}
+		b, _ := json.Marshal(stopBlock)
+		writeSSE("content_block_stop", string(b))
+		currentBlockIdx++
+	}
+
+	// 4. Emit tool calls as tool_use blocks
+	for _, tc := range toolCalls {
+		toolStart := map[string]interface{}{
+			"type":  "content_block_start",
+			"index": currentBlockIdx,
+			"content_block": map[string]interface{}{
+				"type":  "tool_use",
+				"id":    tc.ID,
+				"name":  tc.Function.Name,
+				"input": map[string]interface{}{},
+			},
+		}
+		tsb, _ := json.Marshal(toolStart)
+		writeSSE("content_block_start", string(tsb))
+
+		toolDelta := map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": currentBlockIdx,
+			"delta": map[string]interface{}{
+				"type":         "input_json_delta",
+				"partial_json": tc.Function.Arguments,
+			},
+		}
+		tdb, _ := json.Marshal(toolDelta)
+		writeSSE("content_block_delta", string(tdb))
+
+		toolStop := map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": currentBlockIdx,
+		}
+		tstb, _ := json.Marshal(toolStop)
+		writeSSE("content_block_stop", string(tstb))
+		currentBlockIdx++
+	}
+
+	// 5. message_delta
+	stopReason := "end_turn"
+	if len(toolCalls) > 0 {
+		stopReason = "tool_use"
+	}
+	outTok := (accumulatedText.Len() + len(reasoning)) / 4
+	if outTok < 1 {
+		outTok = 1
+	}
+
+	msgDelta := map[string]interface{}{
+		"type": "message_delta",
+		"delta": map[string]interface{}{
+			"stop_reason":   stopReason,
+			"stop_sequence": nil,
+		},
+		"usage": map[string]interface{}{
+			"output_tokens": outTok,
+		},
+	}
+	mdb, _ := json.Marshal(msgDelta)
+	writeSSE("message_delta", string(mdb))
+
+	// 6. message_stop
+	msgStop := map[string]interface{}{
+		"type": "message_stop",
+	}
+	msb, _ := json.Marshal(msgStop)
+	writeSSE("message_stop", string(msb))
+
+	// Update session
+	if sessionKey != "" && activeConvID != "" {
+		globalSessions.Update(sessionKey, &SessionState{
+			ConvID:        activeConvID,
+			Model:         model,
+			ToolsHash:     toolsHash,
+			MessageCount:  len(currentHashes),
+			HistoryHashes: currentHashes,
+		})
+	}
+}
+
+func handleNonStreamingAnthropicMessages(
+	w http.ResponseWriter,
+	r *http.Request,
+	args []string,
+	completionID, model string,
+	createdTs int64,
+	sessionKey string,
+	isAux, isDelta bool,
+	initialConvID, finalPrompt, fallbackFullPrompt string,
+	currentHashes []string,
+	toolsHash string,
+	promptTokens int,
+) {
+	select {
+	case agySem <- struct{}{}:
+		defer func() { <-agySem }()
+	case <-r.Context().Done():
+		http.Error(w, "Request canceled while waiting for execution slot", http.StatusRequestTimeout)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), DefaultTimeout)
+	defer cancel()
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	var waitErr error
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		stdoutBuf.Reset()
+		stderrBuf.Reset()
+
+		if attempt > 1 {
+			log.Printf("[Anthropic-Proxy] Non-stream retry (attempt %d/2) for %s...", attempt, completionID)
+			if isDelta {
+				if ctx.Err() != nil || r.Context().Err() != nil {
+					return
+				}
+				if sessionKey != "" {
+					globalSessions.Invalidate(sessionKey)
+				}
+				var filteredArgs []string
+				for idx := 0; idx < len(args); idx++ {
+					if args[idx] == "--conversation" {
+						idx++
+						continue
+					}
+					filteredArgs = append(filteredArgs, args[idx])
+				}
+				args = filteredArgs
+				finalPrompt = fallbackFullPrompt
+				isDelta = false
+			}
+		}
+
+		cmd := exec.CommandContext(ctx, agyBin, args...)
+		cmd.Dir = workspaceDir
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Env = append(os.Environ(), "PATH="+filepath.Join(os.Getenv("HOME"), ".local/bin")+":"+os.Getenv("PATH"))
+		cmd.Stdin = strings.NewReader(finalPrompt)
+		cmd.Stdout = &stdoutBuf
+		cmd.Stderr = &stderrBuf
+
+		if err := cmd.Start(); err != nil {
+			log.Printf("[Anthropic-Proxy] Non-stream start error: %v", err)
+			http.Error(w, fmt.Sprintf("AGY Error: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		var processExited atomic.Bool
+		doneProcess := make(chan struct{})
+		go func(c *exec.Cmd) {
+			select {
+			case <-ctx.Done():
+				if !processExited.Load() && c.Process != nil {
+					_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+				}
+			case <-doneProcess:
+			}
+		}(cmd)
+
+		waitErr = cmd.Wait()
+		processExited.Store(true)
+		close(doneProcess)
+
+		if waitErr == nil {
+			break
+		}
+
+		log.Printf("[Anthropic-Proxy] Non-stream attempt %d failed (err=%v, stderr=%s)", attempt, waitErr, stderrBuf.String())
+		if strings.Contains(stderrBuf.String(), "--effort is not supported") {
+			var filteredArgs []string
+			for idx := 0; idx < len(args); idx++ {
+				if args[idx] == "--effort" {
+					idx++
+					continue
+				}
+				filteredArgs = append(filteredArgs, args[idx])
+			}
+			args = filteredArgs
+		}
+	}
+
+	if waitErr != nil && stdoutBuf.Len() == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"type": "error",
+			"error": map[string]string{
+				"type":    "api_error",
+				"message": fmt.Sprintf("AGY Error: %v: %s", waitErr, stderrBuf.String()),
+			},
+		})
+		return
+	}
+
+	var agyRes struct {
+		Response       string `json:"response"`
+		ConversationID string `json:"conversation"`
+		Usage          struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+			TotalTokens  int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+
+	rawOut := stdoutBuf.Bytes()
+	_ = json.Unmarshal(rawOut, &agyRes)
+
+	respText := agyRes.Response
+	if respText == "" {
+		respText = string(rawOut)
+	}
+
+	activeConvID := agyRes.ConversationID
+	if activeConvID == "" {
+		activeConvID = initialConvID
+	}
+
+	cleanText, toolCalls := parseToolCalls(respText)
+	stopReason := "end_turn"
+	if len(toolCalls) > 0 {
+		stopReason = "tool_use"
+	}
+
+	var contentBlocks []map[string]interface{}
+	if cleanText != "" {
+		contentBlocks = append(contentBlocks, map[string]interface{}{
+			"type": "text",
+			"text": cleanText,
+		})
+	}
+	for _, tc := range toolCalls {
+		var inputObj interface{}
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &inputObj); err != nil {
+			inputObj = map[string]string{"raw": tc.Function.Arguments}
+		}
+		contentBlocks = append(contentBlocks, map[string]interface{}{
+			"type":  "tool_use",
+			"id":    tc.ID,
+			"name":  tc.Function.Name,
+			"input": inputObj,
+		})
+	}
+
+	inTok := agyRes.Usage.InputTokens
+	if inTok == 0 {
+		inTok = promptTokens
+	}
+	outTok := agyRes.Usage.OutputTokens
+	if outTok == 0 {
+		outTok = len(respText) / 4
+		if outTok < 1 {
+			outTok = 1
+		}
+	}
+
+	respPayload := map[string]interface{}{
+		"id":            completionID,
+		"type":          "message",
+		"role":          "assistant",
+		"model":         model,
+		"content":       contentBlocks,
+		"stop_reason":   stopReason,
+		"stop_sequence": nil,
+		"usage": map[string]interface{}{
+			"input_tokens":  inTok,
+			"output_tokens": outTok,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("anthropic-version", "2023-06-01")
+	_ = json.NewEncoder(w).Encode(respPayload)
+
+	if !isAux && sessionKey != "" && activeConvID != "" && waitErr == nil {
+		oldState := globalSessions.Get(sessionKey)
+		turns := 1
+		createdAt := time.Now()
+		if oldState != nil {
+			turns = oldState.TotalTurns + 1
+			createdAt = oldState.CreatedAt
+		}
+		globalSessions.Update(sessionKey, &SessionState{
+			ConvID:        activeConvID,
+			Model:         model,
+			CreatedAt:     createdAt,
+			LastSeen:      time.Now(),
+			MessageCount:  len(currentHashes),
+			HistoryHashes: currentHashes,
+			ToolsHash:     toolsHash,
+			TotalTurns:    turns,
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Ollama Routes
 // -----------------------------------------------------------------------------
 func handleOllamaShow(w http.ResponseWriter, r *http.Request) {
@@ -3292,6 +4374,16 @@ func handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 func authMiddleware(next http.Handler) http.Handler {
 	apiKey := getAPIKey()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// CORS headers
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, anthropic-version")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		// Health endpoint is public for local probing
 		if r.URL.Path == "/health" {
 			next.ServeHTTP(w, r)
@@ -3302,6 +4394,9 @@ func authMiddleware(next http.Handler) http.Handler {
 			authHeader := r.Header.Get("Authorization")
 			token := strings.TrimPrefix(authHeader, "Bearer ")
 			token = strings.TrimSpace(token)
+			if token == "" {
+				token = strings.TrimSpace(r.Header.Get("X-Api-Key"))
+			}
 			if subtle.ConstantTimeCompare([]byte(token), []byte(apiKey)) != 1 {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
@@ -3352,6 +4447,7 @@ func main() {
 	mux.HandleFunc("GET /api/v1/models", handleModels)
 	mux.HandleFunc("GET /v1/models/", handleModelInfo)
 	mux.HandleFunc("POST /v1/chat/completions", handleChatCompletions)
+	mux.HandleFunc("POST /v1/messages", handleAnthropicMessages)
 	mux.HandleFunc("POST /api/show", handleOllamaShow)
 	mux.HandleFunc("GET /api/tags", handleOllamaTags)
 
