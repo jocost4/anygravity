@@ -3,191 +3,73 @@
   <a href="README.pt-BR.md"><b>🇧🇷 Português (Brasil)</b></a>
 </p>
 
-```text
-                                         ::-==+**+=:              
-                                 :::::-=*><<<<>*=+>)}[*:          
-                            :  :=>)[}%%#[[[}@@@@#>++]%)-     :    
-                           :+>)}##[<+-     -[@@%[><[#)=           
-                        :*)])]#@%*:   :-*<[%%}[][[[<=      ::     
-                      :>[)*>[@@@@%###%%%%##%}}[)*=:   :----:      
-                     -[%]=--*]}#%%#%###}[]<*-:   :-===-:::        
-                     -#%[>+=: ::::::    : :::-++===-:::::         
-                      =)][[]<>*+*+++**>*><+*=-:::::               
-                         ::-===++===-::                           
+# Anygravity
 
-  █████╗ ███╗   ██╗██╗   ██╗ ██████╗ ██████╗   █████╗ ██╗   ██╗██╗████████╗██╗   ██╗
-██╔══██╗████╗  ██║╚██╗ ██╔╝██╔════╝ ██╔══██╗██╔══██╗██║   ██║██║╚══██╔══╝╚██╗ ██╔╝
-███████║██╔██╗ ██║ ╚████╔╝ ██║  ███╗██████╔╝███████║██║   ██║██║   ██║    ╚████╔╝ 
-██╔══██║██║╚██╗██║  ╚██╔╝  ██║   ██║██╔══██╗██╔══██║╚██╗ ██╔╝██║   ██║     ╚██╔╝  
-██║  ██║██║ ╚████║   ██║   ╚██████╔╝██║  ██║██║  ██║ ╚████╔╝ ██║   ██║      ██║   
-╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚═╝   ╚═╝      ╚═╝   
-```
+[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go&logoColor=white)](https://go.dev/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat)](LICENSE)
 
-<p align="center">
-  <b>High-Performance Production Go Pipe &amp; MCP Bridge for Any AI Agent</b><br>
-  <i>Connects Google Antigravity (<code>agy</code> CLI) as an OpenAI SSE Inference Provider &amp; MCP Server for Hermes, Claude Code, Cursor, OpenCode, Codex &amp; Beyond</i>
-</p>
-
-<p align="center">
-  <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.22+-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go Version"></a>
-  <a href="#-memory-benchmarks"><img src="https://img.shields.io/badge/RAM-~2.9%20MB-2ea44f?style=for-the-badge" alt="Memory"></a>
-  <a href="#-the-hard-problems-solved"><img src="https://img.shields.io/badge/Zero-GIL-blueviolet?style=for-the-badge" alt="Zero GIL"></a>
-  <a href="#-the-hard-problems-solved"><img src="https://img.shields.io/badge/STDIN-Streaming-orange?style=for-the-badge" alt="STDIN Streaming"></a>
-  <a href="#-test-suite"><img src="https://img.shields.io/badge/Tests-100%25%20Passing-brightgreen?style=for-the-badge" alt="Tests"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge" alt="License"></a>
-  <a href="https://github.com/jocost4/anygravity/stargazers"><img src="https://img.shields.io/github/stars/jocost4/anygravity?style=for-the-badge" alt="Stars"></a>
-</p>
+A lightweight, high-performance bridge written in pure Go (zero external dependencies, zero CGO) that exposes the Google Antigravity CLI (`agy`) as an OpenAI-compatible and Anthropic-compatible API. It allows any coding agent or LLM client (Hermes, Claude Code, Cursor, OpenCode, Aider, etc.) to use your Google Antigravity subscription for inference, tool calling, and multi-agent workflows.
 
 ---
 
-## 🚀 Overview
+## Features
 
-**Anygravity** is an ultra-lightweight, production-grade bridge written in **pure standard-library Go (zero external dependencies, zero CGO, 100% static binary)**. It connects Google Antigravity (`agy` CLI) directly to **Any AI Agent** (Hermes Agent, Claude Code, Cursor, OpenCode, Codex, Aider, OpenDevin, OmniRoute) as an OpenAI SSE inference provider and an MCP subagent server.
-
-Designed specifically to run reliably in resource-constrained environments (such as cloud VPS instances with 1 vCPU and 1 GB RAM) without freezing, leaking memory, or crashing during long agentic multi-turn conversations.
-
----
-
-## 💡 The Hard Problems Solved
-
-Bridging a CLI assistant with an autonomous agent orchestrator presents unique architecture challenges:
-
-1. **`ARG_MAX` Linux Limit Bypass (`E2BIG - argument list too long`)**:
-   - Standard wrappers execute the CLI with `-p "<prompt>"`. In multi-turn sessions with tool return outputs (`Ran [...] + 18 commands`), the command-line length easily exceeds the Linux kernel `ARG_MAX` limit, causing immediate process crashes.
-   - **Anygravity** streams prompts and full history asynchronously through **STDIN Pipes**, effortlessly handling huge contexts (benchmarked with 300,000+ characters) with zero size limitations.
-
-2. **Ultra-Low Memory Footprint (~2.9 MB RSS)**:
-   - Replaces heavy Python implementations (FastAPI/Uvicorn ~72 MB) with a static native Go binary.
-   - Consumes only **~2.9 MB of RAM** and **zero GIL** (Global Interpreter Lock), eliminating event loop hangs on single-core servers.
-
-3. **Concurrency Semaphore (`AGY_MAX_CONCURRENCY`)**:
-   - Replaced monolithic global mutex locks with an idiomatic Go channel semaphore. Supports parallel request execution (default: 4, configurable via `AGY_MAX_CONCURRENCY`) with full context cancellation support.
-
-4. **Instant Time-To-First-Token (TTFT) SSE Streaming**:
-   - Emits the initial role chunk and streams text deltas immediately as tokens arrive, even when tools are registered.
-   - Selectively switches to tool-buffering only when tool call markers are encountered, using prefix-aware semantic deduplication when flushing.
-
-5. **Bidirectional Tool Calling & Agentic Loop**:
-   - Translates OpenAI tool schemas into instructions Antigravity understands.
-   - Protects tool execution with workspace hooks (`.agents/hooks.json`) denying local execution by `agy`, delegating 100% of tool execution back to the agent.
-   - Features a balanced-brace JSON parser (`extractJSONObject`) that cleanly handles deeply nested JSON objects and arrays without regex truncations.
-
-6. **Non-Blocking Debounced Session Persistence**:
-   - Background worker with a 2-second ticker and dirty flag persists `antigravity_session_map.json` asynchronously, keeping HTTP handlers completely non-blocking.
-   - Goroutine lifecycle is tied to the server root context, guaranteeing zero goroutine leaks on graceful shutdown.
-
-7. **Reasoning Extraction (`reasoning_content`)**:
-   - Extracts model thinking and step updates from Antigravity session transcripts with `sync.RWMutex` caching and `sync.Pool` 256KB buffer reuse.
-   - Strips tool call markers from reasoning blocks so thinking output is 100% clean.
-
-8. **SSE Heartbeat Keep-Alive**:
-   - Transmits periodic SSE comments (`: ping\n\n`) every 10 seconds during long model generation phases, preventing Hermes Desktop WebSockets or reverse proxies from dropping the connection.
-
-9. **Graceful Shutdown**:
-   - Captures `SIGINT` and `SIGTERM` signals, triggers session flush, cleans up subprocess groups (`syscall.Kill(-pid, SIGKILL)`), and cleanly shuts down the HTTP listener.
-
-10. **Stateful Delta-Feeding & 1:1 Session Sync Engine**:
-    - Solves the stateful-agent-meets-stateful-CLI paradox: instead of re-sending the accumulated message history to an existing Antigravity conversation (which causes exponential $O(N^2)$ token explosion), Anygravity extracts and transmits strictly the **turn delta** (~300 bytes vs ~380 KB).
-    - Unlocks 100% KV Cache hits on Gemini/Claude backends, dropping multi-turn TTFT to sub-second speeds.
-    - Features self-healing desync guards that automatically handle history compaction, reprompts, and auxiliary task isolation (titling, guardrails, memory updates), strictly preserving **1 single conversation per session** in the Antigravity Brain.
-
-11. **Clean Process Group Teardown & Anti-Hang Engine**:
-    - Subprocesses spawned during CLI tasks (such as background MCP servers, computer-use drivers like `cua-driver.exe`, and telemetry handles) can keep file descriptors open, causing standard wrappers to freeze on `cmd.Wait()` until timing out.
-    - Anygravity intercepts the completion event (`{"event": "result"}`), immediately commits session state, flushes the complete response, and enforces a graceful 500ms termination window followed by process group cleanup (`syscall.Kill(-pid, SIGKILL)`).
-
-12. **Hallucinated Tool-Result Cleanup & Anti-Duplication**:
-    - Gemini models occasionally hallucinate simulated `[Tool Result for '...']:` blocks and premature answers before or immediately after generating `<tool_call>`.
-    - Anygravity scrubs fake tool execution logs and strips post-tool preambles so that responses are never duplicated in the user interface and tools execute strictly on the client agent.
-
-13. **Collapsed Model Families & Dynamic Reasoning Effort Mapping**:
-    - The raw catalog containing 13 individual model-effort variants is collapsed into 5 clean base model families (`gemini-4-argon`, `gemini-3.8-flash`, `claude-opus-5-5`, `claude-sonnet-5-5`, `gpt-oss-120b`).
-    - Standard OpenAI `reasoning_effort` parameters (or the Hermes EFFORT picker: Minimal, Low, Medium, High) dynamically resolve to the exact underlying backend variant without cluttering dropdown menus with 3 duplicates per model.
-
-14. **Subagent Visibility & Parallel Task Announcements**:
-    - When delegating sub-tasks (`delegate_task`, `subagents`), Anygravity detects batch arrays and parallel task delegations, streaming explicit status announcements so orchestrators (like Hermes) always display subagent dispatch progress clearly.
+- **Dual Protocol Support:** Compatible with both **OpenAI Chat Completions** (`/v1/chat/completions`) and **Anthropic Messages API** (`/v1/messages`, `/messages`) with full Server-Sent Events (SSE) streaming.
+- **Tool Calling & Parser:** Automatic extraction of `<tool_call>` blocks and native function calls into standard client-facing tool schemas.
+- **Dynamic Model Discovery:** Automatically queries your local `agy models` catalog and exposes available models via `GET /v1/models`.
+- **Effort Mapping:** Standard OpenAI `reasoning_effort` (`low`, `medium`, `high`, `xhigh`) dynamically maps to corresponding Antigravity effort variants.
+- **Quota & Usage Monitoring:** Real-time quota monitoring via `GET /v1/usage` for 5-hour and weekly rate limits across model families.
+- **Session State & Delta Sync:** Maintains 1:1 conversation continuity in Antigravity Brain by transmitting turn deltas instead of resending full histories.
+- **Process Isolation:** Runs `agy` instances in dedicated process groups (`setpgid`) with clean process tree cleanup on cancellation or timeout.
+- **Ultra-low Footprint:** Consumes ~3 MB RAM, single static binary, pure standard library.
 
 ---
 
-## 📐 Architecture
+## Architecture
 
 ```mermaid
 flowchart LR
-    A["Any AI Agent<br>(Hermes, Claude Code, Cursor, etc.)"] -->|OpenAI SSE /v1/chat/completions| B["Anygravity Go Proxy :20130"]
-    B -->|Concurrent Stdin Stream| C["Google Antigravity CLI"]
-    C -->|Gemini 4 / Claude 5.5 / GPT-OSS| D(("Google / Anthropic AI"))
-    C -.->|transcript.jsonl| B
-    B -->|reasoning_content + tool_calls| A
+    A["AI Agent / Client<br>(Hermes, Claude Code, Cursor)"] -->|OpenAI /v1/chat/completions<br>or Anthropic /v1/messages| B["Anygravity Go Proxy (:20130)"]
+    B -->|STDIN Stream / agy CLI| C["Google Antigravity Backend"]
+    C -.->|transcript.jsonl / SSE| B
+    B -->|SSE Stream + Tool Calls| A
 ```
 
 ---
 
-## 📊 Memory Benchmarks
+## Quick Start
 
-Measured on an Ubuntu 24.04 VPS (1 vCPU, 1 GB RAM):
+### Build from source
 
-| Metric | Legacy Proxy (Python / FastAPI) | **Anygravity (Native Go)** | Difference |
-| :--- | :--- | :--- | :--- |
-| **RSS Memory Usage** | ~72.4 MB | **~2.9 MB** | **-96% RAM** |
-| **Startup Latency** | ~1.42s | **< 15ms** | **94x Faster** |
-| **CGO / Dynamic Libs** | Requires Python runtime & glibc | **Zero CGO (100% Static)** | Full Portability |
-| **Context Length Limit** | Crashed at ~128KB (`ARG_MAX`) | **Unlimited (STDIN Stream)** | Massive Contexts |
-| **Concurrency** | Single-threaded GIL lock | **Configurable Semaphore** | Multi-slot Parallel |
+Requires Go 1.22+:
 
----
-
-## 📦 Quick Installation
-
-### 1. Clone & Build
 ```bash
 git clone https://github.com/jocost4/anygravity.git
 cd anygravity
+go build -o anygravity main.go
+./anygravity
+```
 
-# System-wide install (runs under your detected user):
-sudo ./install.sh
+The proxy starts on `http://127.0.0.1:20130`.
 
-# Or rootless user-mode install (ideal for WSL & desktops without sudo):
+### Run as a systemd service (User Mode)
+
+```bash
 ./install.sh --user
-```
 
-The script compiles the static binary, installs it, automatically detects your user and home directory, generates the systemd service hardened to 64MB memory max, and starts the daemon.
-
-For manual multi-user installations without the script, you can use the included template unit:
-```bash
-sudo cp systemd/anygravity@.service /etc/systemd/system/
-sudo systemctl enable --now anygravity@$USER.service
-```
-
-### 2. Service Management
-
-**For system-wide installs (`sudo ./install.sh`):**
-```bash
-# Check status
-sudo systemctl status anygravity
-
-# Tail live logs
-sudo journalctl -u anygravity -f
-
-# Restart daemon
-sudo systemctl restart anygravity
-```
-
-**For user-mode / rootless installs (`./install.sh --user`):**
-```bash
-# Check status
+# Manage service
 systemctl --user status anygravity
-
-# Tail live logs
 journalctl --user -u anygravity -f
-
-# Restart daemon
 systemctl --user restart anygravity
 ```
 
 ---
 
-## ⚙️ Hermes Agent Configuration
+## Configuration
 
-Add the custom provider to `~/.hermes/config.yaml`:
+### Hermes Agent
+
+Add Anygravity as a custom provider in `~/.hermes/config.yaml`:
 
 ```yaml
 custom_providers:
@@ -196,83 +78,89 @@ custom_providers:
     api_key: anygravity-local
 ```
 
-*(Models are discovered automatically via `GET /v1/models` — you do not need to list models manually in `config.yaml`)*
+*(Models are discovered automatically via `GET /v1/models`)*.
 
-### Set default model in Hermes:
+To set a default model:
 ```bash
-hermes config set model.default gemini-4-argon
+hermes config set model.default gemini-3.8-flash
+```
+
+### Claude Code & Anthropic Clients
+
+Point the Anthropic base URL to Anygravity:
+
+```bash
+export ANTHROPIC_BASE_URL="http://localhost:20130"
+export ANTHROPIC_API_KEY="anygravity-local"
+claude
+```
+
+### OpenAI Clients / SDK
+
+```bash
+export OPENAI_BASE_URL="http://localhost:20130/v1"
+export OPENAI_API_KEY="anygravity-local"
 ```
 
 ---
 
-## 🔌 Integrated MCP Server (`antigravity_mcp_server.py`)
+## Supported Models
 
-The repository includes a standalone MCP server exposing Antigravity subagents and skills directly to Hermes:
+Anygravity dynamically maps requests to the available models in your local `agy` installation:
+
+| Model ID | Backend Name | Reasoning Effort | Best For |
+| :--- | :--- | :--- | :--- |
+| `gemini-4-argon` | Gemini 4 Argon | `low`, `medium`, `high` | Frontier reasoning, complex architecture & debugging |
+| `gemini-4-hydrogen` | Gemini 4 Hydrogen | `low`, `medium`, `high`, `xhigh` | Fast agentic loops, daily coding & rapid edits |
+| `gemini-pro-orchestrator-g1-pro` | Orchestrator (Argon) | Native routing | Multi-agent coordination & task decomposition |
+| `gemini-3.8-flash` | Gemini 3.8 Flash | `low`, `medium`, `high` | Everyday high-speed tasks, terminal commands & scripts |
+| `claude-opus-5-5` | Claude Opus 5.5 | `low`, `medium`, `high` | Deep analytical writing & system design |
+| `claude-sonnet-5-5` | Claude Sonnet 5.5 | `low`, `medium`, `high` | Fast programming & multi-turn coding |
+| `gpt-oss-120b` | GPT-OSS 120B | `medium` | Open weights reasoning |
+
+---
+
+## HTTP API Reference
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/health` | Health check, uptime, goroutine count, and memory stats |
+| `GET` | `/metrics` | Prometheus metrics (request count, latency, memory) |
+| `GET` | `/v1/models` | List available models (OpenAI format) |
+| `GET` | `/v1/models/{id}` | Specific model details |
+| `GET` | `/v1/usage` | Antigravity subscription quota (5-hour and weekly buckets) |
+| `POST` | `/v1/chat/completions` | OpenAI Chat Completions (streaming and non-streaming) |
+| `POST` | `/v1/messages` | Anthropic Messages API (streaming and non-streaming) |
+| `POST` | `/messages` | Anthropic Messages API alias |
+| `GET` | `/api/tags` | Ollama model tags compatibility |
+| `POST` | `/api/show` | Ollama model show compatibility |
+
+---
+
+## Integrated MCP Server
+
+The repository includes an optional standalone MCP server exposing Antigravity subagents and skills directly to Hermes:
 
 ```yaml
 # Add in ~/.hermes/config.yaml under mcp_servers:
 mcp_servers:
   antigravity:
     command: python3
-    args: ["/home/YOUR_USER/anygravity/mcp/antigravity_mcp_server.py"]
+    args: ["/path/to/anygravity/mcp/antigravity_mcp_server.py"]
 ```
 
-### Available MCP Tools:
-- `antigravity_run`: Execute autonomous tasks and code refactors in the terminal.
-- `antigravity_plan`: Run Antigravity in non-destructive planning mode (`--mode plan`).
-- `antigravity_get_conversation`: Retrieve full conversation transcripts.
-- `antigravity_list_artifacts`: List generated markdown reports and architecture plans.
-- `antigravity_get_artifact`: Inspect the full content of any artifact.
-- `antigravity_list_skills`: Discover available skills in the Antigravity ecosystem.
-
 ---
 
-## 🎯 Supported Models & Dynamic Reasoning Effort
+## Testing
 
-Anygravity dynamically queries and supports the models available on your local `agy` installation. Catalog variants are collapsed into base model families with dynamic reasoning effort:
-
-| Model ID (Base) | Name | Reasoning Effort Tiers | Notes |
-| :--- | :--- | :--- | :--- |
-| `gemini-4-argon` | Gemini 4 Argon | `high`, `medium`, `low` | **Flagship** — state-of-the-art coding and reasoning |
-| `gemini-3.8-flash` | Gemini 3.8 Flash | `high`, `medium`, `low` | Ultra-fast multimodal model |
-| `claude-opus-5-5` | Claude Opus 5.5 | `high`, `medium`, `low` | Deep analytical reasoning & architecture design |
-| `claude-sonnet-5-5` | Claude Sonnet 5.5 | `high`, `medium`, `low` | High-speed coding & agentic orchestration |
-| `gpt-oss-120b` | GPT-OSS 120B | `medium` | Open-weights model hosted on Google Cloud infrastructure |
-
-### How Reasoning Effort Works:
-- **Hermes EFFORT Picker**: When using the Hermes UI, select any reasoning level (**Minimal**, **Low**, **Medium**, **High**) in the model flyout menu.
-- **OpenAI API**: Send `"reasoning_effort": "medium"` (or `"high"` / `"low"`) in `/v1/chat/completions`. Anygravity resolves it dynamically to the corresponding backend model variant (e.g., `gemini-4-argon` + `medium` → `gemini-4-argon-medium`). Defaults to `high` if omitted.
-- **Backwards Compatibility**: Explicit variant IDs like `gemini-4-argon-high` or `claude-sonnet-5-5-medium` are still resolved directly.
-
-The proxy refreshes the catalog from `agy models` at startup and periodically, so newly enabled Antigravity models appear automatically without requiring a proxy update.
-
----
-
-## 🧪 Test Suite
-
-Run the unit test suite covering tool parsing, argument normalization, session key extraction, collapsed model resolution, and streaming deduplication:
+Run the test suite:
 
 ```bash
-cd anygravity
 go test -v ./...
 ```
 
 ---
 
-## 🛠️ HTTP API Endpoints
+## License
 
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `GET` | `/health` | Service health, uptime, active goroutines, and RSS memory in MB |
-| `GET` | `/metrics` | Prometheus metrics for request counts, latency, and memory |
-| `GET` | `/v1/models` | OpenAI-compatible model catalog |
-| `GET` | `/v1/models/{id}` | Model metadata |
-| `POST` | `/v1/chat/completions` | SSE streaming & non-streaming chat completions with tool calling |
-| `POST` | `/api/show` | Ollama format compatibility |
-| `GET` | `/api/tags` | Ollama model tags compatibility |
-
----
-
-## 🛡️ License
-
-Released under the **MIT License**. Built to unite **Google Antigravity** with **Any AI Agent**.
+MIT License. See [LICENSE](LICENSE) for details.
