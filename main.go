@@ -2942,7 +2942,12 @@ func handleStreamingCompletion(
 						} else {
 							// 2. Check if trailing suffix matches an incomplete prefix of a tool marker
 							splitIdx := len(pending)
-							const maxMarkerLen = 16
+							maxMarkerLen := 0
+							for _, m := range markers {
+								if len(m) > maxMarkerLen {
+									maxMarkerLen = len(m)
+								}
+							}
 							maxK := len(pending)
 							if maxK > maxMarkerLen {
 								maxK = maxMarkerLen
@@ -4023,7 +4028,12 @@ func handleStreamingAnthropicMessages(
 									streamPending.Reset()
 								} else {
 									splitIdx := len(pending)
-									const maxMarkerLen = 16
+									maxMarkerLen := 0
+									for _, m := range markers {
+										if len(m) > maxMarkerLen {
+											maxMarkerLen = len(m)
+										}
+									}
 									maxK := len(pending)
 									if maxK > maxMarkerLen {
 										maxK = maxMarkerLen
