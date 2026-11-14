@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -73,6 +74,11 @@ var (
 		{ID: "gemini-4-argon-high", Name: "Gemini 4 Argon (High)"},
 		{ID: "gemini-4-argon-medium", Name: "Gemini 4 Argon (Medium)"},
 		{ID: "gemini-4-argon-low", Name: "Gemini 4 Argon (Low)"},
+		{ID: "gemini-4-hydrogen-high", Name: "Gemini 4 Hydrogen (High)"},
+		{ID: "gemini-4-hydrogen-xhigh", Name: "Gemini 4 Hydrogen (XHigh)"},
+		{ID: "gemini-4-hydrogen-medium", Name: "Gemini 4 Hydrogen (Medium)"},
+		{ID: "gemini-4-hydrogen-low", Name: "Gemini 4 Hydrogen (Low)"},
+		{ID: "gemini-pro-orchestrator-g1-pro", Name: "Orchestrator (Argon)"},
 		{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High)"},
 		{ID: "gemini-3.8-flash-medium", Name: "Gemini 3.8 Flash (Medium)"},
 		{ID: "gemini-3.8-flash-low", Name: "Gemini 3.8 Flash (Low)"},
@@ -2055,6 +2061,124 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "proxy_mem_alloc_bytes %d\n", m.Alloc)
 }
 
+type AgyUsageBucket struct {
+	ID                string  `json:"id"`
+	Name              string  `json:"name"`
+	Window            string  `json:"window"`
+	RemainingFraction float64 `json:"remaining_fraction"`
+	ResetTime         string  `json:"reset_time"`
+}
+
+type AgyUsageGroup struct {
+	Name    string           `json:"name"`
+	Buckets []AgyUsageBucket `json:"buckets"`
+}
+
+type AgyUsageOutput struct {
+	Command struct {
+		Data struct {
+			Groups []AgyUsageGroup `json:"groups"`
+		} `json:"data"`
+	} `json:"command"`
+}
+
+var (
+	agyUsageMu        sync.Mutex
+	lastAgyUsageCheck time.Time
+	cachedAgyUsage    []byte
+)
+
+func handleUsage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	agyUsageMu.Lock()
+	if len(cachedAgyUsage) > 0 && time.Since(lastAgyUsageCheck) < 45*time.Second {
+		_, _ = w.Write(cachedAgyUsage)
+		agyUsageMu.Unlock()
+		return
+	}
+	agyUsageMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, agyBin, "--print", "/usage", "--output-format", "json")
+	out, err := cmd.Output()
+	if err != nil {
+		agyUsageMu.Lock()
+		if len(cachedAgyUsage) > 0 {
+			_, _ = w.Write(cachedAgyUsage)
+			agyUsageMu.Unlock()
+			return
+		}
+		agyUsageMu.Unlock()
+		http.Error(w, fmt.Sprintf(`{"error":"failed to run agy /usage: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+
+	var agyRes AgyUsageOutput
+	if err := json.Unmarshal(out, &agyRes); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"failed to parse agy /usage output: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+
+	type WireWindow struct {
+		Label       string  `json:"label"`
+		UsedPercent float64 `json:"used_percent"`
+		ResetsAt    string  `json:"resets_at"`
+		Scope       string  `json:"scope"`
+	}
+
+	var windows []WireWindow
+	for _, group := range agyRes.Command.Data.Groups {
+		for _, b := range group.Buckets {
+			usedPct := (1.0 - b.RemainingFraction) * 100.0
+			if usedPct < 0 {
+				usedPct = 0
+			}
+			label := group.Name
+			if b.Window == "5h" {
+				label += " (5h)"
+			} else if b.Window == "weekly" {
+				label += " (Weekly)"
+			}
+			windows = append(windows, WireWindow{
+				Label:       label,
+				UsedPercent: math.Round(usedPct*100) / 100,
+				ResetsAt:    b.ResetTime,
+				Scope:       "account",
+			})
+		}
+	}
+
+	res := map[string]interface{}{
+		"provider": "anygravity",
+		"windows":  windows,
+		"raw":      agyRes.Command.Data.Groups,
+	}
+
+	data, err := json.Marshal(res)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	agyUsageMu.Lock()
+	cachedAgyUsage = data
+	lastAgyUsageCheck = time.Now()
+	agyUsageMu.Unlock()
+
+	_, _ = w.Write(data)
+}
+
 func handleModels(w http.ResponseWriter, r *http.Request) {
 	models := getBaseModels()
 	type ModelEntry struct {
@@ -2225,6 +2349,10 @@ func resolveModelAndEffort(rawModel, rawEffort string) (model string, effort str
 	// 3. Dynamic family / fallback matching for retired or renamed models
 	if !found {
 		switch {
+		case strings.Contains(requested, "orchestrator"):
+			selected, found = preferredCatalogModel("gemini-pro-orchestrator-g1-pro")
+		case strings.Contains(requested, "hydrogen"):
+			selected, found = preferredCatalogModel("gemini-4-hydrogen")
 		case strings.Contains(requested, "argon") || strings.Contains(requested, "gemini-4"):
 			selected, found = preferredCatalogModel("gemini-4-argon")
 		case strings.Contains(requested, "flash") || strings.Contains(requested, "gemini-3"):
@@ -4446,6 +4574,8 @@ func main() {
 	mux.HandleFunc("GET /v1/models", handleModels)
 	mux.HandleFunc("GET /api/v1/models", handleModels)
 	mux.HandleFunc("GET /v1/models/", handleModelInfo)
+	mux.HandleFunc("GET /v1/usage", handleUsage)
+	mux.HandleFunc("GET /usage", handleUsage)
 	mux.HandleFunc("POST /v1/chat/completions", handleChatCompletions)
 	mux.HandleFunc("POST /v1/messages", handleAnthropicMessages)
 	mux.HandleFunc("POST /messages", handleAnthropicMessages)
