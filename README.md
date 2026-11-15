@@ -63,6 +63,27 @@ journalctl --user -u anygravity -f
 systemctl --user restart anygravity
 ```
 
+### Network Binding (LAN & Tailscale)
+
+By default, Anygravity binds only to `127.0.0.1:20130`. You can bind to additional local network or Tailscale addresses using `HOST` / `BIND_ADDR` or `-host` / `-bind` (comma-separated or repeated):
+
+```bash
+# Bind to localhost + Tailscale IP(s) (auto-detected)
+./anygravity -host 127.0.0.1,tailscale
+
+# Bind to localhost + LAN private IPv4(s) (auto-detected)
+./anygravity -host 127.0.0.1,lan
+
+# Bind to specific IPs, interface names, or Tailscale MagicDNS hostname
+./anygravity -host 127.0.0.1,192.168.1.50,mybox.tail1234.ts.net
+./anygravity -host 127.0.0.1,tailscale0
+
+# Or via environment variables (also supported by ./install.sh)
+HOST="127.0.0.1,tailscale" ANYGRAVITY_API_KEY="your-secret" ./install.sh --user
+```
+
+> **Security note:** Always set `ANYGRAVITY_API_KEY` when binding to non-loopback addresses (`lan`, `tailscale`, `0.0.0.0`, or specific LAN/Tailscale IPs).
+
 ---
 
 ## Configuration

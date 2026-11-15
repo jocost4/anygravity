@@ -63,6 +63,7 @@ After=network.target
 [Service]
 Type=exec
 Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOST=${HOST}
 Environment=PORT=${PORT}
 WorkingDirectory=$HOME
 ExecStart=$USER_BIN_DIR/anygravity
@@ -120,6 +121,7 @@ Type=exec
 User=${INSTALL_USER}
 Environment=HOME=${INSTALL_HOME}
 Environment=PATH=${INSTALL_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOST=${HOST}
 Environment=PORT=${PORT}
 WorkingDirectory=${INSTALL_HOME}
 ExecStart=${BIN_PATH}
@@ -145,10 +147,17 @@ EOF
     SYSTEMCTL_CMD="sudo systemctl status anygravity"
 fi
 
-echo "[+] Verifying health on http://${HOST}:${PORT}/health..."
+HEALTH_HOST="$HOST"
+case "$HOST" in
+    0.0.0.0|::|all|'*'|lan|local|tailscale|ts|*,*)
+        HEALTH_HOST="127.0.0.1"
+        ;;
+esac
+
+echo "[+] Verifying health on http://${HEALTH_HOST}:${PORT}/health..."
 sleep 1
-if curl -sf "http://${HOST}:${PORT}/health" >/dev/null 2>&1; then
-    echo "[✓] Anygravity is running on http://${HOST}:${PORT}!"
+if curl -sf "http://${HEALTH_HOST}:${PORT}/health" >/dev/null 2>&1; then
+    echo "[✓] Anygravity is running on http://${HEALTH_HOST}:${PORT} (HOST=${HOST})!"
 else
     echo "[!] Warning: Server did not respond immediately. Check: $SYSTEMCTL_CMD"
 fi
@@ -158,7 +167,7 @@ echo "Configuration for Hermes (~/.hermes/config.yaml):"
 echo "----------------------------------------------------------"
 echo "custom_providers:"
 echo "  - name: Anygravity (localhost:${PORT})"
-echo "    base_url: http://${HOST}:${PORT}/v1"
+echo "    base_url: http://${HEALTH_HOST}:${PORT}/v1"
 echo "    api_key: anygravity-local"
 echo "----------------------------------------------------------"
 echo "(Models are discovered automatically via GET /v1/models — no manual model list needed!)"

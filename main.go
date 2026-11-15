@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -44,6 +45,9 @@ func getHost() string {
 	if h := os.Getenv("HOST"); h != "" {
 		return h
 	}
+	if h := os.Getenv("BIND_ADDR"); h != "" {
+		return h
+	}
 	return DefaultHost
 }
 
@@ -52,6 +56,319 @@ func getPort() string {
 		return p
 	}
 	return DefaultPort
+}
+
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string {
+	return strings.Join(*s, ",")
+}
+
+func (s *stringSliceFlag) Set(val string) error {
+	for _, part := range strings.Split(val, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			*s = append(*s, trimmed)
+		}
+	}
+	return nil
+}
+
+type netInterfaceInfo struct {
+	Name  string
+	Up    bool
+	Addrs []net.IP
+}
+
+type netResolver struct {
+	listInterfaces func() ([]netInterfaceInfo, error)
+	lookupIP       func(host string) ([]net.IP, error)
+}
+
+func defaultNetResolver() netResolver {
+	return netResolver{
+		listInterfaces: func() ([]netInterfaceInfo, error) {
+			ifaces, err := net.Interfaces()
+			if err != nil {
+				return nil, err
+			}
+			out := make([]netInterfaceInfo, 0, len(ifaces))
+			for _, iface := range ifaces {
+				addrs, err := iface.Addrs()
+				if err != nil {
+					continue
+				}
+				var ips []net.IP
+				for _, a := range addrs {
+					switch v := a.(type) {
+					case *net.IPNet:
+						ips = append(ips, v.IP)
+					case *net.IPAddr:
+						ips = append(ips, v.IP)
+					}
+				}
+				out = append(out, netInterfaceInfo{
+					Name:  iface.Name,
+					Up:    iface.Flags&net.FlagUp != 0,
+					Addrs: ips,
+				})
+			}
+			return out, nil
+		},
+		lookupIP: net.LookupIP,
+	}
+}
+
+var (
+	_, tailscaleIPv4Net, _ = net.ParseCIDR("100.64.0.0/10")
+	_, tailscaleIPv6Net, _ = net.ParseCIDR("fd7a:115c:a1e0::/48")
+)
+
+func isTailscaleIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return tailscaleIPv4Net.Contains(ip4)
+	}
+	return tailscaleIPv6Net.Contains(ip)
+}
+
+func isLANIPv4(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() || isTailscaleIP(ip4) {
+		return false
+	}
+	return ip4.IsPrivate()
+}
+
+func splitHostPortOrHost(spec, defaultPort string) (string, string) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return DefaultHost, defaultPort
+	}
+	if net.ParseIP(spec) != nil {
+		return spec, defaultPort
+	}
+	if strings.HasPrefix(spec, "[") && strings.HasSuffix(spec, "]") {
+		inner := spec[1 : len(spec)-1]
+		if net.ParseIP(inner) != nil {
+			return inner, defaultPort
+		}
+	}
+	if h, p, err := net.SplitHostPort(spec); err == nil {
+		if p == "" {
+			p = defaultPort
+		}
+		return h, p
+	}
+	return spec, defaultPort
+}
+
+// resolveBindAddrs expands bind specifications (IPs, hostnames, interface names,
+// or keywords like "lan", "tailscale", "all", "localhost") into deduplicated host:port targets.
+func resolveBindAddrs(specs []string, defaultPort string, resolver netResolver) ([]string, error) {
+	if len(specs) == 0 {
+		specs = []string{DefaultHost}
+	}
+	if defaultPort == "" {
+		defaultPort = DefaultPort
+	}
+
+	var tokens []string
+	for _, s := range specs {
+		for _, part := range strings.Split(s, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				tokens = append(tokens, trimmed)
+			}
+		}
+	}
+	if len(tokens) == 0 {
+		tokens = []string{DefaultHost}
+	}
+
+	var cachedIfaces []netInterfaceInfo
+	var ifacesLoaded bool
+	loadIfaces := func() ([]netInterfaceInfo, error) {
+		if !ifacesLoaded {
+			var err error
+			cachedIfaces, err = resolver.listInterfaces()
+			if err != nil {
+				return nil, err
+			}
+			ifacesLoaded = true
+		}
+		return cachedIfaces, nil
+	}
+
+	seen := make(map[string]bool)
+	var result []string
+	addTarget := func(host, port string) {
+		addr := net.JoinHostPort(host, port)
+		if !seen[addr] {
+			seen[addr] = true
+			result = append(result, addr)
+		}
+	}
+
+	for _, tok := range tokens {
+		host, port := splitHostPortOrHost(tok, defaultPort)
+		lower := strings.ToLower(host)
+
+		switch lower {
+		case "", "all", "*":
+			addTarget("0.0.0.0", port)
+			continue
+		case "loopback":
+			addTarget("127.0.0.1", port)
+			continue
+		case "lan", "local":
+			ifaces, err := loadIfaces()
+			if err != nil {
+				return nil, fmt.Errorf("failed to list network interfaces for %q: %w", tok, err)
+			}
+			var found []string
+			for _, iface := range ifaces {
+				if !iface.Up {
+					continue
+				}
+				for _, ip := range iface.Addrs {
+					if isLANIPv4(ip) {
+						found = append(found, ip.To4().String())
+					}
+				}
+			}
+			if len(found) == 0 {
+				return nil, fmt.Errorf("no active LAN IPv4 addresses found for %q", tok)
+			}
+			for _, ipStr := range found {
+				addTarget(ipStr, port)
+			}
+			continue
+		case "tailscale", "ts":
+			ifaces, err := loadIfaces()
+			if err != nil {
+				return nil, fmt.Errorf("failed to list network interfaces for %q: %w", tok, err)
+			}
+			var v4s, v6s []string
+			for _, iface := range ifaces {
+				if !iface.Up {
+					continue
+				}
+				isTSIface := strings.HasPrefix(strings.ToLower(iface.Name), "tailscale")
+				for _, ip := range iface.Addrs {
+					if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+						continue
+					}
+					if isTailscaleIP(ip) || isTSIface {
+						if ip4 := ip.To4(); ip4 != nil {
+							v4s = append(v4s, ip4.String())
+						} else {
+							v6s = append(v6s, ip.String())
+						}
+					}
+				}
+			}
+			if len(v4s) == 0 && len(v6s) == 0 {
+				return nil, fmt.Errorf("no active Tailscale IP addresses found for %q (is Tailscale connected?)", tok)
+			}
+			for _, ipStr := range v4s {
+				addTarget(ipStr, port)
+			}
+			for _, ipStr := range v6s {
+				addTarget(ipStr, port)
+			}
+			continue
+		}
+
+		// Literal IP address
+		if ip := net.ParseIP(host); ip != nil {
+			addTarget(host, port)
+			continue
+		}
+
+		// Check if host matches a local network interface name (e.g. eth0, wlan0, tailscale0)
+		if ifaces, err := loadIfaces(); err == nil {
+			var matchedIface *netInterfaceInfo
+			for i := range ifaces {
+				if ifaces[i].Name == host {
+					matchedIface = &ifaces[i]
+					break
+				}
+			}
+			if matchedIface != nil {
+				var v4s, v6s []string
+				for _, ip := range matchedIface.Addrs {
+					if ip.IsLinkLocalUnicast() {
+						continue
+					}
+					if ip4 := ip.To4(); ip4 != nil {
+						v4s = append(v4s, ip4.String())
+					} else {
+						v6s = append(v6s, ip.String())
+					}
+				}
+				if len(v4s) == 0 && len(v6s) == 0 {
+					return nil, fmt.Errorf("interface %q has no usable IP addresses", host)
+				}
+				for _, ipStr := range v4s {
+					addTarget(ipStr, port)
+				}
+				for _, ipStr := range v6s {
+					addTarget(ipStr, port)
+				}
+				continue
+			}
+		}
+
+		// Hostname (e.g. localhost or Tailscale MagicDNS name like mybox.tail1234.ts.net).
+		// If DNS resolves to IPs present on local interfaces, bind to those local IPs;
+		// otherwise fall back to passing the hostname directly to net.Listen.
+		if ips, err := resolver.lookupIP(host); err == nil && len(ips) > 0 {
+			localSet := make(map[string]bool)
+			if ifaces, err := loadIfaces(); err == nil {
+				for _, iface := range ifaces {
+					for _, lip := range iface.Addrs {
+						localSet[lip.String()] = true
+					}
+				}
+			}
+			var matchedLocal []string
+			for _, ip := range ips {
+				if localSet[ip.String()] {
+					matchedLocal = append(matchedLocal, ip.String())
+				}
+			}
+			if len(matchedLocal) > 0 {
+				for _, ipStr := range matchedLocal {
+					addTarget(ipStr, port)
+				}
+				continue
+			}
+		}
+		addTarget(host, port)
+	}
+
+	return result, nil
+}
+
+func classifyBindAddrs(addrs []string) (hasWildcard, hasNonLoopback bool) {
+	for _, addr := range addrs {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			continue
+		}
+		if ip := net.ParseIP(host); ip != nil {
+			if ip.IsUnspecified() {
+				hasWildcard = true
+				hasNonLoopback = true
+			} else if !ip.IsLoopback() {
+				hasNonLoopback = true
+			}
+		} else if !strings.EqualFold(host, "localhost") {
+			hasNonLoopback = true
+		}
+	}
+	return hasWildcard, hasNonLoopback
 }
 
 func getAPIKey() string {
@@ -4554,6 +4871,57 @@ func authMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
+	var hostFlags stringSliceFlag
+	var portFlag string
+	var showVersion bool
+
+	flag.Var(&hostFlags, "host", "Bind host/IP/interface/keyword (e.g. 127.0.0.1, 0.0.0.0, lan, tailscale, tailscale0, or comma-separated list)")
+	flag.Var(&hostFlags, "bind", "Alias for -host")
+	flag.StringVar(&portFlag, "port", "", "Default listen port (overrides PORT env var)")
+	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
+	flag.Parse()
+
+	if showVersion {
+		fmt.Printf("anygravity %s\n", Version)
+		return
+	}
+
+	port := getPort()
+	if portFlag != "" {
+		port = portFlag
+	}
+
+	bindSpecs := []string(hostFlags)
+	if len(bindSpecs) == 0 {
+		bindSpecs = []string{getHost()}
+	}
+
+	addrs, err := resolveBindAddrs(bindSpecs, port, defaultNetResolver())
+	if err != nil {
+		log.Fatalf("Failed to resolve bind address(es): %v", err)
+	}
+
+	hasWildcard, hasNonLoopback := classifyBindAddrs(addrs)
+	if getAPIKey() == "" {
+		if hasWildcard {
+			log.Printf("[SECURITY WARNING] Server is binding to all interfaces (%s) without ANYGRAVITY_API_KEY! Set ANYGRAVITY_API_KEY to protect your machine.", strings.Join(addrs, ", "))
+		} else if hasNonLoopback {
+			log.Printf("[SECURITY WARNING] Server is binding to non-loopback address(es) (%s) without ANYGRAVITY_API_KEY! Set ANYGRAVITY_API_KEY to protect your machine.", strings.Join(addrs, ", "))
+		}
+	}
+
+	listeners := make([]net.Listener, 0, len(addrs))
+	for _, addr := range addrs {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			for _, l := range listeners {
+				_ = l.Close()
+			}
+			log.Fatalf("Failed to listen on %s: %v", addr, err)
+		}
+		listeners = append(listeners, ln)
+	}
+
 	initWorkspace()
 
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
@@ -4594,16 +4962,8 @@ func main() {
 
 	handler := authMiddleware(mux)
 
-	host := getHost()
-	port := getPort()
-	addr := net.JoinHostPort(host, port)
-
-	if (host == "0.0.0.0" || host == "") && getAPIKey() == "" {
-		log.Printf("[SECURITY WARNING] Server is binding to all interfaces (%s) without ANYGRAVITY_API_KEY! Set ANYGRAVITY_API_KEY to protect your machine.", addr)
-	}
-
 	server := &http.Server{
-		Addr:         addr,
+		Addr:         addrs[0],
 		Handler:      handler,
 		ReadTimeout:  180 * time.Second,
 		WriteTimeout: 0, // Disabled for SSE streaming; request contexts manage timeouts
@@ -4623,8 +4983,25 @@ func main() {
 		_ = server.Shutdown(ctx)
 	}()
 
-	log.Printf("[Anygravity] Service listening on http://%s (RSS: ~2.9MB)", addr)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	for _, ln := range listeners {
+		log.Printf("[Anygravity] Service listening on http://%s (RSS: ~2.9MB)", ln.Addr().String())
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(listeners))
+	for _, ln := range listeners {
+		wg.Add(1)
+		go func(l net.Listener) {
+			defer wg.Done()
+			if err := server.Serve(l); err != nil && err != http.ErrServerClosed {
+				errCh <- fmt.Errorf("%s: %w", l.Addr().String(), err)
+			}
+		}(ln)
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
 		log.Fatalf("Server error: %v", err)
 	}
 }
