@@ -63,6 +63,27 @@ journalctl --user -u anygravity -f
 systemctl --user restart anygravity
 ```
 
+### Bind em Rede Local (LAN) e Tailscale
+
+Por padrão, o Anygravity escuta apenas em `127.0.0.1:20130`. Você pode fazer bind em outros endereços da rede local ou do Tailscale via `HOST` / `BIND_ADDR` ou pelas flags `-host` / `-bind` (separados por vírgula ou repetidos):
+
+```bash
+# Bind em localhost + IP(s) do Tailscale (detecção automática)
+./anygravity -host 127.0.0.1,tailscale
+
+# Bind em localhost + IP(s) privados da LAN (detecção automática)
+./anygravity -host 127.0.0.1,lan
+
+# Bind em IPs específicos, nomes de interface ou hostname MagicDNS do Tailscale
+./anygravity -host 127.0.0.1,192.168.1.50,mybox.tail1234.ts.net
+./anygravity -host 127.0.0.1,tailscale0
+
+# Ou via variáveis de ambiente (também suportado pelo ./install.sh)
+HOST="127.0.0.1,tailscale" ANYGRAVITY_API_KEY="sua-chave-secreta" ./install.sh --user
+```
+
+> **Nota de segurança:** Sempre defina `ANYGRAVITY_API_KEY` ao fazer bind em endereços que não sejam loopback (`lan`, `tailscale`, `0.0.0.0` ou IPs de LAN/Tailscale).
+
 ---
 
 ## Configuração

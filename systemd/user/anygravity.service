@@ -5,6 +5,8 @@ After=network.target
 [Service]
 Type=exec
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Set HOST to bind additional addresses (e.g., 127.0.0.1,tailscale or 127.0.0.1,lan or 0.0.0.0)
+Environment=HOST=127.0.0.1
 Environment=PORT=20130
 WorkingDirectory=%h
 ExecStart=%h/.local/bin/anygravity

@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1180,6 +1184,323 @@ func TestAnthropicMessages_CORSAndAuth(t *testing.T) {
 		t.Errorf("expected X-Api-Key to pass authentication, but got 401")
 	}
 }
+
+func testNetResolver() netResolver {
+	return netResolver{
+		listInterfaces: func() ([]netInterfaceInfo, error) {
+			return []netInterfaceInfo{
+				{
+					Name: "lo",
+					Up:   true,
+					Addrs: []net.IP{
+						net.ParseIP("127.0.0.1"),
+						net.ParseIP("::1"),
+					},
+				},
+				{
+					Name: "eth0",
+					Up:   true,
+					Addrs: []net.IP{
+						net.ParseIP("192.168.1.50"),
+						net.ParseIP("fe80::1"),
+					},
+				},
+				{
+					Name: "tailscale0",
+					Up:   true,
+					Addrs: []net.IP{
+						net.ParseIP("100.64.10.20"),
+						net.ParseIP("fd7a:115c:a1e0::42"),
+					},
+				},
+				{
+					Name: "down0",
+					Up:   false,
+					Addrs: []net.IP{
+						net.ParseIP("10.0.0.99"),
+					},
+				},
+			}, nil
+		},
+		lookupIP: func(host string) ([]net.IP, error) {
+			switch host {
+			case "mybox.tail1234.ts.net":
+				return []net.IP{
+					net.ParseIP("100.64.10.20"),
+					net.ParseIP("fd7a:115c:a1e0::42"),
+				}, nil
+			case "remote.example.com":
+				return []net.IP{net.ParseIP("93.184.216.34")}, nil
+			default:
+				return nil, fmt.Errorf("unknown host: %s", host)
+			}
+		},
+	}
+}
+
+func TestResolveBindAddrs(t *testing.T) {
+	resolver := testNetResolver()
+
+	tests := []struct {
+		name        string
+		specs       []string
+		defaultPort string
+		want        []string
+		wantErr     bool
+	}{
+		{
+			name:        "default loopback",
+			specs:       nil,
+			defaultPort: "20130",
+			want:        []string{"127.0.0.1:20130"},
+		},
+		{
+			name:        "multiple comma-separated IPs with deduplication",
+			specs:       []string{"127.0.0.1, 192.168.1.50, 127.0.0.1"},
+			defaultPort: "20130",
+			want:        []string{"127.0.0.1:20130", "192.168.1.50:20130"},
+		},
+		{
+			name:        "per-entry custom port and IPv6",
+			specs:       []string{"127.0.0.1:20130", "100.64.10.20:20131", "::1"},
+			defaultPort: "20130",
+			want:        []string{"127.0.0.1:20130", "100.64.10.20:20131", "[::1]:20130"},
+		},
+		{
+			name:        "lan keyword excludes loopback, down, and tailscale",
+			specs:       []string{"127.0.0.1,lan"},
+			defaultPort: "20130",
+			want:        []string{"127.0.0.1:20130", "192.168.1.50:20130"},
+		},
+		{
+			name:        "tailscale keyword picks IPv4 and IPv6",
+			specs:       []string{"127.0.0.1", "tailscale"},
+			defaultPort: "20130",
+			want:        []string{"127.0.0.1:20130", "100.64.10.20:20130", "[fd7a:115c:a1e0::42]:20130"},
+		},
+		{
+			name:        "interface name resolution skips link-local",
+			specs:       []string{"eth0"},
+			defaultPort: "20130",
+			want:        []string{"192.168.1.50:20130"},
+		},
+		{
+			name:        "tailscale MagicDNS hostname resolves to local Tailscale IPs",
+			specs:       []string{"mybox.tail1234.ts.net"},
+			defaultPort: "20130",
+			want:        []string{"100.64.10.20:20130", "[fd7a:115c:a1e0::42]:20130"},
+		},
+		{
+			name:        "all keyword maps to 0.0.0.0",
+			specs:       []string{"all"},
+			defaultPort: "20130",
+			want:        []string{"0.0.0.0:20130"},
+		},
+		{
+			name:        "whitespace and empty tokens fall back to default loopback",
+			specs:       []string{"  , ,  "},
+			defaultPort: "",
+			want:        []string{"127.0.0.1:20130"},
+		},
+		{
+			name:        "bracketed IPv6 with and without port, plus trailing colon",
+			specs:       []string{"[::1]", "[::1]:20131", "192.168.1.50:"},
+			defaultPort: "20130",
+			want:        []string{"[::1]:20130", "[::1]:20131", "192.168.1.50:20130"},
+		},
+		{
+			name:        "keyword with explicit port",
+			specs:       []string{"tailscale:20135", "lan:8080"},
+			defaultPort: "20130",
+			want:        []string{"100.64.10.20:20135", "[fd7a:115c:a1e0::42]:20135", "192.168.1.50:8080"},
+		},
+		{
+			name:        "remote or unresolved hostname falls back to host:port",
+			specs:       []string{"remote.example.com", "unresolvable.invalid:9000"},
+			defaultPort: "20130",
+			want:        []string{"remote.example.com:20130", "unresolvable.invalid:9000"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveBindAddrs(tc.specs, tc.defaultPort, resolver)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil (%v)", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveBindAddrs_ErrorsWhenMissingInterfaces(t *testing.T) {
+	emptyResolver := netResolver{
+		listInterfaces: func() ([]netInterfaceInfo, error) {
+			return []netInterfaceInfo{
+				{Name: "lo", Up: true, Addrs: []net.IP{net.ParseIP("127.0.0.1")}},
+			}, nil
+		},
+		lookupIP: func(host string) ([]net.IP, error) {
+			return nil, fmt.Errorf("not found")
+		},
+	}
+
+	if _, err := resolveBindAddrs([]string{"lan"}, "20130", emptyResolver); err == nil {
+		t.Errorf("expected error for lan when no LAN IP exists")
+	}
+	if _, err := resolveBindAddrs([]string{"tailscale"}, "20130", emptyResolver); err == nil {
+		t.Errorf("expected error for tailscale when no Tailscale IP exists")
+	}
+
+	linkLocalOnlyResolver := netResolver{
+		listInterfaces: func() ([]netInterfaceInfo, error) {
+			return []netInterfaceInfo{
+				{Name: "eth1", Up: true, Addrs: []net.IP{net.ParseIP("fe80::1")}},
+			}, nil
+		},
+		lookupIP: emptyResolver.lookupIP,
+	}
+	if _, err := resolveBindAddrs([]string{"eth1"}, "20130", linkLocalOnlyResolver); err == nil {
+		t.Errorf("expected error for interface with only link-local IP")
+	}
+
+	failingResolver := netResolver{
+		listInterfaces: func() ([]netInterfaceInfo, error) {
+			return nil, fmt.Errorf("netlink unavailable")
+		},
+		lookupIP: emptyResolver.lookupIP,
+	}
+	if _, err := resolveBindAddrs([]string{"lan"}, "20130", failingResolver); err == nil {
+		t.Errorf("expected error when listInterfaces fails for lan")
+	}
+	if _, err := resolveBindAddrs([]string{"tailscale"}, "20130", failingResolver); err == nil {
+		t.Errorf("expected error when listInterfaces fails for tailscale")
+	}
+}
+
+func TestGetHostPortAndFlagParsing(t *testing.T) {
+	t.Setenv("HOST", "")
+	t.Setenv("BIND_ADDR", "")
+	t.Setenv("PORT", "")
+
+	if got := getHost(); got != DefaultHost {
+		t.Errorf("expected default host %s, got %s", DefaultHost, got)
+	}
+	if got := getPort(); got != DefaultPort {
+		t.Errorf("expected default port %s, got %s", DefaultPort, got)
+	}
+
+	t.Setenv("BIND_ADDR", "100.64.10.20")
+	if got := getHost(); got != "100.64.10.20" {
+		t.Errorf("expected BIND_ADDR fallback, got %s", got)
+	}
+
+	t.Setenv("HOST", "127.0.0.1,lan")
+	t.Setenv("PORT", "21000")
+	if got := getHost(); got != "127.0.0.1,lan" {
+		t.Errorf("expected HOST to take precedence, got %s", got)
+	}
+	if got := getPort(); got != "21000" {
+		t.Errorf("expected PORT 21000, got %s", got)
+	}
+
+	var f stringSliceFlag
+	if err := f.Set("127.0.0.1, tailscale"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := f.Set("lan"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := f.String(); got != "127.0.0.1,tailscale,lan" {
+		t.Errorf("unexpected stringSliceFlag.String(): %s", got)
+	}
+
+	if isTailscaleIP(nil) {
+		t.Errorf("expected isTailscaleIP(nil) == false")
+	}
+	if gotHost, gotPort := splitHostPortOrHost("", "20130"); gotHost != DefaultHost || gotPort != "20130" {
+		t.Errorf("expected (%s, 20130), got (%s, %s)", DefaultHost, gotHost, gotPort)
+	}
+}
+
+func TestDefaultNetResolver(t *testing.T) {
+	ifaces, err := defaultNetResolver().listInterfaces()
+	if err != nil {
+		t.Fatalf("defaultNetResolver().listInterfaces() failed: %v", err)
+	}
+	if len(ifaces) == 0 {
+		t.Fatalf("expected at least one network interface")
+	}
+}
+
+func TestClassifyBindAddrs(t *testing.T) {
+	w, nl := classifyBindAddrs([]string{"127.0.0.1:20130", "[::1]:20130", "localhost:20130"})
+	if w || nl {
+		t.Errorf("loopback-only should be (false, false), got (%v, %v)", w, nl)
+	}
+
+	w, nl = classifyBindAddrs([]string{"127.0.0.1:20130", "100.64.10.20:20130"})
+	if w || !nl {
+		t.Errorf("loopback + tailscale should be (false, true), got (%v, %v)", w, nl)
+	}
+
+	w, nl = classifyBindAddrs([]string{"0.0.0.0:20130"})
+	if !w || !nl {
+		t.Errorf("0.0.0.0 should be (true, true), got (%v, %v)", w, nl)
+	}
+}
+
+func TestMultiListenerServer(t *testing.T) {
+	ln1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen 1: %v", err)
+	}
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_ = ln1.Close()
+		t.Fatalf("listen 2: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", handleHealth)
+
+	srv := &http.Server{Handler: authMiddleware(mux)}
+	var wg sync.WaitGroup
+	for _, ln := range []net.Listener{ln1, ln2} {
+		wg.Add(1)
+		go func(l net.Listener) {
+			defer wg.Done()
+			_ = srv.Serve(l)
+		}(ln)
+	}
+
+	for _, addr := range []string{ln1.Addr().String(), ln2.Addr().String()} {
+		resp, err := http.Get("http://" + addr + "/health")
+		if err != nil {
+			t.Fatalf("GET http://%s/health failed: %v", addr, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 OK from %s, got %d", addr, resp.StatusCode)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown failed: %v", err)
+	}
+	wg.Wait()
+}
+
 
 
 
