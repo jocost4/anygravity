@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestParseToolCalls_TagFormat(t *testing.T) {
@@ -1500,6 +1501,67 @@ func TestMultiListenerServer(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestUTF8HeadTail(t *testing.T) {
+	s := "Automação de Vídeo 🎉"
+	// Slicing in the middle of multi-byte character
+	h := utf8Head(s, 7) // 'ç' is 2 bytes at index 6, 7
+	if !utf8.ValidString(h) {
+		t.Errorf("utf8Head produced invalid UTF-8: %q", h)
+	}
+	tail := utf8Tail(s, 6)
+	if !utf8.ValidString(tail) {
+		t.Errorf("utf8Tail produced invalid UTF-8: %q", tail)
+	}
+}
+
+func TestRemoveArgWithValue(t *testing.T) {
+	args := []string{"--model", "gemini-4-argon", "--conversation", "12345", "--effort", "high"}
+	res := removeArgWithValue(args, "--conversation")
+	expected := []string{"--model", "gemini-4-argon", "--effort", "high"}
+	if !reflect.DeepEqual(res, expected) {
+		t.Errorf("expected %v, got %v", expected, res)
+	}
+}
+
+func TestToolStreamFilter(t *testing.T) {
+	var f toolStreamFilter
+	f.Reset()
+
+	// Feed plain text
+	txt := f.Feed("Hello world! ")
+	if txt != "Hello world! " {
+		t.Errorf("expected immediate text, got %q", txt)
+	}
+	if f.Buffering() {
+		t.Errorf("should not be buffering")
+	}
+
+	// Feed marker start and marker end
+	txt = f.Feed("Here comes: <tool_")
+	if txt != "Here comes: " {
+		t.Errorf("expected prefix before marker, got %q", txt)
+	}
+	txt = f.Feed("call>\n{\"name\": \"test\"}")
+	if txt != "" {
+		t.Errorf("expected empty string while buffering, got %q", txt)
+	}
+	if !f.Buffering() {
+		t.Errorf("should be buffering after tool marker")
+	}
+}
+
+func TestStreamCompletionNotice(t *testing.T) {
+	outcome := agyStreamOutcome{
+		StopReason: agyStopIdle,
+		IdleFor:    15 * time.Second,
+	}
+	notice := streamCompletionNotice(outcome, true)
+	if !strings.Contains(notice, "idle timeout") {
+		t.Errorf("expected idle timeout notice, got %q", notice)
+	}
+}
+
 
 
 

@@ -23,11 +23,13 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // -----------------------------------------------------------------------------
@@ -40,6 +42,567 @@ const (
 	DefaultTimeout = 180 * time.Second
 	StreamTimeout  = 600 * time.Second
 )
+
+// noLocalExecReminder is repeated in every prompt variant (GEMINI.md, tools prompt,
+// anchor reminder and delta reminder) because in delta mode the model only sees the
+// per-turn reminder, not the original [AVAILABLE TOOLS] block.
+const noLocalExecReminder = "- You are an external completion model. You do NOT have terminal access. " +
+	"NEVER attempt to execute bash commands, scripts, or local CLI calls like 'agy' to create subagents. " +
+	"When asked to delegate or run subagents, choose strictly from [AVAILABLE TOOLS] (e.g. 'delegate_task' or client tools)."
+
+// envDuration reads a Go duration (e.g. "15s") or a plain number of seconds from env.
+func envDuration(name string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return def
+}
+
+// Streaming watchdog tunables. Package-level vars so tests can shrink them.
+var (
+	// Max silence on agy stdout once the model is mid-response (an agent_response step
+	// is streaming text) or while a <tool_call> is being buffered.
+	streamIdleTimeout = envDuration("ANYGRAVITY_STREAM_IDLE_TIMEOUT", 15*time.Second)
+	// Max silence before the response started / between agent steps (covers time-to-
+	// first-token on huge contexts and the re-generation after a denied native tool).
+	streamFirstOutputTimeout = envDuration("ANYGRAVITY_STREAM_FIRST_OUTPUT_TIMEOUT", 120*time.Second)
+	// After step_update{step_type:agent_response,state:DONE}, how long to wait for the
+	// "result" event before finalizing the turn ourselves.
+	agentDoneGrace = envDuration("ANYGRAVITY_AGENT_DONE_GRACE", 1500*time.Millisecond)
+	// After "result", how long agy may linger before its process group is terminated.
+	agyResultExitGrace = 500 * time.Millisecond
+	// After stdout EOF, how long agy may take to exit on its own.
+	agyEOFExitGrace = 2 * time.Second
+	// SIGTERM -> SIGKILL escalation delay for the agy process group.
+	agyTermGrace = 1500 * time.Millisecond
+)
+
+// utf8Head returns at most n bytes of s without splitting a UTF-8 sequence.
+// Byte-slicing multi-byte runes produced invalid UTF-8 prompts, which agy fails to
+// serialize ("string field contains invalid UTF-8") and then hangs silently.
+func utf8Head(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// utf8Tail returns at most the last n bytes of s without splitting a UTF-8 sequence.
+func utf8Tail(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	start := len(s) - n
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
+}
+
+// sanitizePromptUTF8 guarantees the prompt piped into agy is valid UTF-8.
+func sanitizePromptUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return strings.ToValidUTF8(s, "\uFFFD")
+}
+
+// limitedBuffer is a goroutine-safe writer that keeps only the first max bytes.
+type limitedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+	max int
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if room := b.max - b.buf.Len(); room > 0 {
+		if len(p) > room {
+			b.buf.Write(p[:room])
+		} else {
+			b.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (b *limitedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func agyEnv() []string {
+	return append(os.Environ(), "PATH="+filepath.Join(os.Getenv("HOME"), ".local/bin")+":"+os.Getenv("PATH"))
+}
+
+// newAgyCmd builds an agy command that runs in its own process group, so the whole
+// tree (agy + MCP servers + language servers + anything it spawned) can be signalled.
+func newAgyCmd(args []string) *exec.Cmd {
+	cmd := exec.Command(agyBin, args...)
+	cmd.Dir = workspaceDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = agyEnv()
+	// Bound Wait() if a grandchild that escaped the group keeps stdout/stderr open.
+	cmd.WaitDelay = 3 * time.Second
+	return cmd
+}
+
+// reapProcessGroup waits for a started command to exit. If it has not exited within
+// naturalGrace, the whole process group gets SIGTERM, then SIGKILL after termGrace.
+// Finally any surviving group members are swept with SIGKILL. Always returns after
+// the leader has been reaped, so no zombie or orphaned agy is left behind.
+func reapProcessGroup(cmd *exec.Cmd, naturalGrace, termGrace time.Duration) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	pgid := cmd.Process.Pid
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+
+	var err error
+	exited := false
+	if naturalGrace > 0 {
+		select {
+		case err = <-waitCh:
+			exited = true
+		case <-time.After(naturalGrace):
+		}
+	}
+	if !exited {
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		select {
+		case err = <-waitCh:
+		case <-time.After(termGrace):
+			log.Printf("[Proxy] agy process group %d ignored SIGTERM for %s; sending SIGKILL", pgid, termGrace)
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			err = <-waitCh
+		}
+	}
+	// Sweep leftovers (MCP servers, language servers, sub-processes) sharing the group.
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	return err
+}
+
+// toolStreamFilter implements the sliding-window <tool_call> marker detection used
+// while streaming: plain text is released immediately, a possible marker prefix is
+// held back, and once a full marker is seen everything else is buffered.
+type toolStreamFilter struct {
+	pending   strings.Builder
+	buffering bool
+}
+
+var toolStreamMarkers = []string{"<tool_call>", "<function_call>", "call:default_api:", "```tool_call"}
+
+func (f *toolStreamFilter) Reset() {
+	f.pending.Reset()
+	f.buffering = false
+}
+
+func (f *toolStreamFilter) Buffering() bool { return f.buffering }
+
+// Feed consumes a delta and returns the text that is safe to stream now.
+func (f *toolStreamFilter) Feed(delta string) string {
+	if f.buffering || delta == "" {
+		return ""
+	}
+	f.pending.WriteString(delta)
+	pending := f.pending.String()
+
+	toolMarkerIdx := -1
+	maxMarkerLen := 0
+	for _, m := range toolStreamMarkers {
+		if len(m) > maxMarkerLen {
+			maxMarkerLen = len(m)
+		}
+		if idx := strings.Index(pending, m); idx != -1 && (toolMarkerIdx == -1 || idx < toolMarkerIdx) {
+			toolMarkerIdx = idx
+		}
+	}
+	if toolMarkerIdx != -1 {
+		f.buffering = true
+		f.pending.Reset()
+		return pending[:toolMarkerIdx]
+	}
+
+	splitIdx := len(pending)
+	maxK := len(pending)
+	if maxK > maxMarkerLen {
+		maxK = maxMarkerLen
+	}
+	for k := maxK; k > 0 && splitIdx == len(pending); k-- {
+		suffix := pending[len(pending)-k:]
+		for _, m := range toolStreamMarkers {
+			if strings.HasPrefix(m, suffix) {
+				splitIdx = len(pending) - k
+				break
+			}
+		}
+	}
+	f.pending.Reset()
+	f.pending.WriteString(pending[splitIdx:])
+	return pending[:splitIdx]
+}
+
+// Flush releases held-back text when no tool call is being buffered.
+func (f *toolStreamFilter) Flush() string {
+	if f.buffering {
+		return ""
+	}
+	s := f.pending.String()
+	f.pending.Reset()
+	return s
+}
+
+// Stop reasons reported by runAgyStream.
+const (
+	agyStopResult        = "result"               // agy emitted its final "result" event
+	agyStopEOF           = "eof"                  // agy closed stdout / exited by itself
+	agyStopAgentDone     = "agent_done"           // agent_response DONE, no result within grace
+	agyStopAgentDoneTool = "agent_done_tool_call" // same, with a <tool_call> buffered
+	agyStopIdle          = "idle_timeout"         // stdout silent mid-response / while buffering a tool call
+	agyStopFirstOutput   = "first_output_timeout" // stdout silent before/between responses
+	agyStopDeadline      = "deadline"             // absolute StreamTimeout reached
+	agyStopCanceled      = "canceled"             // client disconnected
+	agyStopStartError    = "start_error"
+)
+
+type agyStreamHooks struct {
+	// OnTextDelta receives every text_delta, synchronously, in the caller goroutine.
+	OnTextDelta func(delta string)
+	// IsBufferingTool reports whether the caller is currently holding back a tool call.
+	IsBufferingTool func() bool
+}
+
+type agyStreamOutcome struct {
+	ConvID         string
+	ResultReceived bool
+	ResultStatus   string
+	ResultResponse string
+	SawText        bool
+	GotStdout      bool
+	StopReason     string
+	WaitErr        error
+	StartErr       error
+	Stderr         string
+	Elapsed        time.Duration
+	IdleFor        time.Duration
+}
+
+// watchdogStopped reports whether the run was ended by Anygravity (not by agy itself).
+func (o agyStreamOutcome) watchdogStopped() bool {
+	switch o.StopReason {
+	case agyStopIdle, agyStopFirstOutput, agyStopDeadline, agyStopAgentDone, agyStopAgentDoneTool:
+		return true
+	}
+	return false
+}
+
+// retryable: only fast, self-inflicted agy failures (process exited with an error and
+// produced nothing). Watchdog/timeout/cancel stops are NEVER retried, because a retry
+// re-sends the whole (possibly 300k+ token) context and can loop for many minutes.
+func (o agyStreamOutcome) retryable() bool {
+	return o.StopReason == agyStopEOF && o.WaitErr != nil && !o.ResultReceived && !o.SawText
+}
+
+// failureMessage builds a human-readable explanation for an empty/failed turn.
+func (o agyStreamOutcome) failureMessage() string {
+	detail := strings.TrimSpace(o.Stderr)
+	if len(detail) > 600 {
+		detail = utf8Tail(detail, 600)
+	}
+	var msg string
+	switch o.StopReason {
+	case agyStopFirstOutput:
+		msg = fmt.Sprintf("agy produced no output for %s (watchdog). The turn was aborted to prevent a deadlock. Do not resend automatically; check the agy logs or start a new session", o.IdleFor.Round(time.Second))
+	case agyStopIdle:
+		msg = fmt.Sprintf("agy stopped streaming for %s mid-response (watchdog). The turn was aborted to prevent a deadlock", o.IdleFor.Round(time.Second))
+	case agyStopDeadline:
+		msg = fmt.Sprintf("agy exceeded the absolute stream timeout (%s)", StreamTimeout)
+	case agyStopCanceled:
+		msg = "request canceled by client"
+	case agyStopStartError:
+		msg = fmt.Sprintf("failed to start agy: %v", o.StartErr)
+	case agyStopAgentDone, agyStopAgentDoneTool:
+		msg = "agy finished the agent step without producing any text"
+	default:
+		if o.ResultReceived && o.ResultStatus != "" && !strings.EqualFold(o.ResultStatus, "SUCCESS") {
+			msg = fmt.Sprintf("agy finished with status %s and an empty response", o.ResultStatus)
+		} else if o.WaitErr != nil {
+			msg = fmt.Sprintf("agy exited with error: %v", o.WaitErr)
+		} else {
+			msg = "agy returned an empty response"
+		}
+	}
+	if detail != "" {
+		msg += ": " + detail
+	}
+	return msg
+}
+
+// agyStreamEvent mirrors the agy --output-format stream-json NDJSON schema.
+type agyStreamEvent struct {
+	Event          string `json:"event"`
+	ConversationID string `json:"conversation_id"`
+	StepUpdate     struct {
+		StepIndex int    `json:"step_index"`
+		State     string `json:"state"`
+		StepType  string `json:"step_type"`
+		TextDelta string `json:"text_delta"`
+	} `json:"step_update"`
+	Result struct {
+		ConversationID string `json:"conversation_id"`
+		Status         string `json:"status"`
+		Response       string `json:"response"`
+	} `json:"result"`
+}
+
+// runAgyStream launches agy with stream-json output, feeds the prompt via stdin and
+// pumps events to hooks until agy finishes or a watchdog fires:
+//   - "result" event                                  -> normal completion
+//   - agent_response DONE and no "result" in grace    -> finalize (agy stuck after the turn)
+//   - no stdout for streamIdleTimeout while mid-response or buffering a <tool_call>
+//   - no stdout for streamFirstOutputTimeout before/between responses
+//   - ctx done (client gone or absolute StreamTimeout)
+//
+// The agy process group is always reaped before returning.
+func runAgyStream(ctx context.Context, args []string, prompt string, hooks agyStreamHooks) agyStreamOutcome {
+	var out agyStreamOutcome
+	start := time.Now()
+	defer func() { out.Elapsed = time.Since(start) }()
+
+	if hooks.IsBufferingTool == nil {
+		hooks.IsBufferingTool = func() bool { return false }
+	}
+	if hooks.OnTextDelta == nil {
+		hooks.OnTextDelta = func(string) {}
+	}
+
+	cmd := newAgyCmd(args)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		out.StopReason, out.StartErr = agyStopStartError, err
+		return out
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		out.StopReason, out.StartErr = agyStopStartError, err
+		return out
+	}
+	stderrBuf := &limitedBuffer{max: 64 * 1024}
+	cmd.Stderr = stderrBuf
+
+	if err := ctx.Err(); err != nil {
+		out.StopReason, out.StartErr = agyStopCanceled, err
+		return out
+	}
+	if err := cmd.Start(); err != nil {
+		out.StopReason, out.StartErr = agyStopStartError, err
+		return out
+	}
+
+	go func() {
+		defer stdin.Close()
+		if _, err := io.WriteString(stdin, prompt); err != nil {
+			log.Printf("[Proxy] stdin write error: %v", err)
+		}
+	}()
+
+	lines := make(chan []byte, 1024)
+	stopRead := make(chan struct{})
+	go func() {
+		defer close(lines)
+		reader := bufio.NewReaderSize(stdout, 256*1024)
+		for {
+			line, err := reader.ReadBytes('\n')
+			if len(line) > 0 {
+				select {
+				case lines <- line:
+				case <-stopRead:
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	tickEvery := 250 * time.Millisecond
+	for _, d := range []time.Duration{streamIdleTimeout / 4, agentDoneGrace / 4} {
+		if d > 0 && d < tickEvery {
+			tickEvery = d
+		}
+	}
+	if tickEvery < 5*time.Millisecond {
+		tickEvery = 5 * time.Millisecond
+	}
+	ticker := time.NewTicker(tickEvery)
+	defer ticker.Stop()
+
+	lastActivity := time.Now()
+	responseStreaming := false // current agent_response step has started emitting text
+	var graceDeadline time.Time
+	graceStep := -1
+	graceSticky := false
+
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				out.StopReason = agyStopDeadline
+			} else {
+				out.StopReason = agyStopCanceled
+			}
+			break loop
+
+		case raw, ok := <-lines:
+			if !ok {
+				out.StopReason = agyStopEOF
+				break loop
+			}
+			lastActivity = time.Now()
+			out.GotStdout = true
+			raw = bytes.TrimSpace(raw)
+			if len(raw) == 0 {
+				continue
+			}
+			var ev agyStreamEvent
+			if err := json.Unmarshal(raw, &ev); err != nil {
+				continue
+			}
+			switch ev.Event {
+			case "init":
+				if ev.ConversationID != "" {
+					out.ConvID = ev.ConversationID
+				}
+			case "result":
+				if ev.Result.ConversationID != "" {
+					out.ConvID = ev.Result.ConversationID
+				} else if ev.ConversationID != "" {
+					out.ConvID = ev.ConversationID
+				}
+				out.ResultReceived = true
+				out.ResultStatus = ev.Result.Status
+				out.ResultResponse = ev.Result.Response
+				out.StopReason = agyStopResult
+				break loop
+			case "step_update":
+				su := ev.StepUpdate
+				// agy moved on to another step (e.g. a native tool attempt that the hook
+				// denies, followed by a re-generation): a text-only DONE was not final.
+				if !graceDeadline.IsZero() && !graceSticky && su.StepIndex != graceStep {
+					graceDeadline = time.Time{}
+				}
+				if su.TextDelta != "" {
+					out.SawText = true
+					if su.StepType == "" || su.StepType == "agent_response" {
+						responseStreaming = true
+					}
+					hooks.OnTextDelta(su.TextDelta)
+				}
+				if su.StepType == "agent_response" && su.State == "DONE" {
+					responseStreaming = false
+					if graceDeadline.IsZero() {
+						graceDeadline = time.Now().Add(agentDoneGrace)
+						graceStep = su.StepIndex
+						graceSticky = hooks.IsBufferingTool()
+					}
+				}
+			}
+
+		case now := <-ticker.C:
+			if !graceDeadline.IsZero() && !now.Before(graceDeadline) {
+				if graceSticky || hooks.IsBufferingTool() {
+					out.StopReason = agyStopAgentDoneTool
+				} else {
+					out.StopReason = agyStopAgentDone
+				}
+				break loop
+			}
+			limit := streamFirstOutputTimeout
+			if responseStreaming || hooks.IsBufferingTool() {
+				limit = streamIdleTimeout
+			}
+			if idle := now.Sub(lastActivity); idle >= limit {
+				out.IdleFor = idle
+				if responseStreaming || hooks.IsBufferingTool() {
+					out.StopReason = agyStopIdle
+				} else {
+					out.StopReason = agyStopFirstOutput
+				}
+				break loop
+			}
+		}
+	}
+	close(stopRead)
+
+	switch out.StopReason {
+	case agyStopResult:
+		out.WaitErr = reapProcessGroup(cmd, agyResultExitGrace, agyTermGrace)
+	case agyStopEOF:
+		out.WaitErr = reapProcessGroup(cmd, agyEOFExitGrace, agyTermGrace)
+	default:
+		log.Printf("[Proxy] agy stream stopped by watchdog (reason=%s, idle=%s, sawText=%v, buffering=%v); terminating process group %d",
+			out.StopReason, out.IdleFor.Round(time.Millisecond), out.SawText, hooks.IsBufferingTool(), cmd.Process.Pid)
+		out.WaitErr = reapProcessGroup(cmd, 0, agyTermGrace)
+	}
+	out.Stderr = strings.TrimSpace(stderrBuf.String())
+	return out
+}
+
+// removeArgWithValue strips a flag and its following argument value from args.
+func removeArgWithValue(args []string, flag string) []string {
+	var filtered []string
+	for idx := 0; idx < len(args); idx++ {
+		if args[idx] == flag {
+			idx++ // skip value too
+			continue
+		}
+		filtered = append(filtered, args[idx])
+	}
+	return filtered
+}
+
+// streamCompletionNotice optionally returns an informational suffix if the turn
+// was cut short by a watchdog timer, so the client/user understands why it stopped.
+func streamCompletionNotice(outcome agyStreamOutcome, hasStreamedText bool) string {
+	if !outcome.watchdogStopped() {
+		return ""
+	}
+	prefix := "\n\n"
+	if !hasStreamedText {
+		prefix = ""
+	}
+	switch outcome.StopReason {
+	case agyStopIdle:
+		return fmt.Sprintf("%s[Note: Response stream ended due to %s idle timeout]", prefix, outcome.IdleFor.Round(time.Second))
+	case agyStopDeadline:
+		return fmt.Sprintf("%s[Note: Response stream ended due to deadline timeout (%s)]", prefix, StreamTimeout)
+	case agyStopFirstOutput:
+		return fmt.Sprintf("%s[Note: Response stream ended before first output after %s]", prefix, outcome.IdleFor.Round(time.Second))
+	default:
+		return ""
+	}
+}
 
 func getHost() string {
 	if h := os.Getenv("HOST"); h != "" {
@@ -444,7 +1007,11 @@ func initWorkspace() {
 	geminiMd := filepath.Join(workspaceDir, "GEMINI.md")
 	geminiContent := `# ANYGRAVITY COMPLETION ENGINE
 You are acting as the backend AI completion model for an external AI Agent.
-You MUST NOT execute any local system tools or commands directly.
+You are an external completion model. You do NOT have terminal access.
+NEVER attempt to execute bash commands, scripts, or local CLI calls like 'agy' to create subagents.
+When asked to delegate or run subagents, choose strictly from [AVAILABLE TOOLS] (e.g. 'delegate_task' or client tools).
+You MUST NOT execute any local system tools or commands directly (no run_command, no terminal, no file tools, no browser tools).
+Every native tool call is DENIED by policy and only wastes time and tokens: never call native tools, never retry them.
 When a tool is needed, output:
 <tool_call>
 {"name": "tool_name", "arguments": {...}}
@@ -1077,7 +1644,8 @@ func formatToolsPrompt(tools []ToolItem) string {
 
 [CRITICAL INSTRUCTIONS FOR AI AGENT COMPLETION]
 You are acting as the backend AI completion model for an external AI Agent.
-- You DO NOT have permission to use or execute any local system tools directly.
+- You are an external completion model. You do NOT have terminal access. NEVER attempt to execute bash commands, scripts, or local CLI calls like 'agy' to create subagents. When asked to delegate or run subagents, choose strictly from [AVAILABLE TOOLS] (e.g. 'delegate_task' or client tools).
+- You DO NOT have permission to use or execute any local system tools directly. Native tool calls (run_command, terminal, file or browser tools) are always DENIED; never call or retry them.
 - When an action or information retrieval is genuinely needed, choose from [AVAILABLE TOOLS] and respond with:
 <tool_call>
 {"name": "tool_name", "arguments": {"param": "value"}}
@@ -1134,6 +1702,7 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 	if toolsPrompt != "" {
 		reminder = "[CRITICAL REMINDER]\n" +
 			"You are the completion engine for the AI Agent. Do NOT invoke local tools directly.\n" +
+			noLocalExecReminder + "\n" +
 			"- If an action/tool call is genuinely needed, choose from [AVAILABLE TOOLS] and respond with:\n" +
 			"<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n" +
 			"- When dispatching subagents (e.g. 'delegate_task'), inform the user before <tool_call> of the subagent's goal.\n" +
@@ -1163,18 +1732,18 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 		switch msg.Role {
 		case "system":
 			if len(c) > 20000 {
-				c = c[:10000] + "\n\n[... system instructions middle truncated ...]\n\n" + c[len(c)-8000:]
+				c = utf8Head(c, 10000) + "\n\n[... system instructions middle truncated ...]\n\n" + utf8Tail(c, 8000)
 			}
 			rendered[i] = "[System Instructions]:\n" + c + "\n\n"
 
 		case "user":
 			if isHistorical {
 				if len(c) > 1000 {
-					c = c[:600] + "\n\n[... historical user prompt truncated ...]\n\n" + c[len(c)-200:]
+					c = utf8Head(c, 600) + "\n\n[... historical user prompt truncated ...]\n\n" + utf8Tail(c, 200)
 				}
 			} else {
 				if len(c) > 50000 {
-					c = c[:25000] + "\n\n[... user input middle truncated to fit buffer ...]\n\n" + c[len(c)-25000:]
+					c = utf8Head(c, 25000) + "\n\n[... user input middle truncated to fit buffer ...]\n\n" + utf8Tail(c, 25000)
 				}
 			}
 			rendered[i] = "User: " + c + "\n\n"
@@ -1184,11 +1753,11 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 			if c != "" {
 				if isHistorical {
 					if len(c) > 800 {
-						c = c[:400] + "\n\n[... historical assistant response truncated ...]\n\n" + c[len(c)-200:]
+						c = utf8Head(c, 400) + "\n\n[... historical assistant response truncated ...]\n\n" + utf8Tail(c, 200)
 					}
 				} else {
 					if len(c) > 8000 {
-						c = c[:4000] + "\n\n[... content truncated for brevity ...]\n\n" + c[len(c)-2000:]
+						c = utf8Head(c, 4000) + "\n\n[... content truncated for brevity ...]\n\n" + utf8Tail(c, 2000)
 					}
 				}
 				asb.WriteString("Assistant: " + c + "\n\n")
@@ -1209,7 +1778,7 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 						argStr = unq
 					}
 					if isHistorical && len(argStr) > 400 {
-						argStr = argStr[:200] + "...}"
+						argStr = utf8Head(argStr, 200) + "...}"
 					}
 					asb.WriteString(fmt.Sprintf("<tool_call>\n{\"name\": \"%s\", \"arguments\": %s}\n</tool_call>\n\n", tc.Function.Name, argStr))
 				}
@@ -1228,11 +1797,11 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 			}
 			if isHistorical {
 				if len(c) > 400 {
-					c = c[:250] + "\n\n[... historical output truncated ...]\n\n" + c[len(c)-100:]
+					c = utf8Head(c, 250) + "\n\n[... historical output truncated ...]\n\n" + utf8Tail(c, 100)
 				}
 			} else {
 				if len(c) > 4000 {
-					c = c[:2000] + "\n\n[... content truncated for brevity ...]\n\n" + c[len(c)-1000:]
+					c = utf8Head(c, 2000) + "\n\n[... content truncated for brevity ...]\n\n" + utf8Tail(c, 1000)
 				}
 			}
 			rendered[i] = fmt.Sprintf("[Tool Result for '%s']:\n%s\n\n", toolName, c)
@@ -1281,7 +1850,7 @@ func formatConversation(messages []ChatMessage, toolsPrompt string) string {
 	}
 
 	sb.WriteString(footer)
-	return sb.String()
+	return sanitizePromptUTF8(sb.String())
 }
 
 func formatDeltaPrompt(messages []ChatMessage, startIndex int) string {
@@ -1311,20 +1880,20 @@ func formatDeltaPrompt(messages []ChatMessage, startIndex int) string {
 				toolName = "tool"
 			}
 			if len(c) > 4000 {
-				c = c[:2000] + "\n\n[... content truncated for brevity ...]\n\n" + c[len(c)-1000:]
+				c = utf8Head(c, 2000) + "\n\n[... content truncated for brevity ...]\n\n" + utf8Tail(c, 1000)
 			}
 			sb.WriteString(fmt.Sprintf("[Tool Result for '%s']:\n%s\n\n", toolName, c))
 
 		case "user":
 			if len(c) > 50000 {
-				c = c[:25000] + "\n\n[... user input middle truncated to fit buffer ...]\n\n" + c[len(c)-25000:]
+				c = utf8Head(c, 25000) + "\n\n[... user input middle truncated to fit buffer ...]\n\n" + utf8Tail(c, 25000)
 			}
 			sb.WriteString("User: " + c + "\n\n")
 
 		case "assistant":
 			if c != "" {
 				if len(c) > 8000 {
-					c = c[:4000] + "\n\n[... content truncated for brevity ...]\n\n" + c[len(c)-2000:]
+					c = utf8Head(c, 4000) + "\n\n[... content truncated for brevity ...]\n\n" + utf8Tail(c, 2000)
 				}
 				sb.WriteString("Assistant: " + c + "\n\n")
 			}
@@ -1351,6 +1920,7 @@ func formatDeltaPrompt(messages []ChatMessage, startIndex int) string {
 
 	sb.WriteString("[CRITICAL REMINDER]\n")
 	sb.WriteString("You are the completion engine for the AI Agent. Do NOT invoke local tools directly.\n")
+	sb.WriteString(noLocalExecReminder + "\n")
 	sb.WriteString("- If an action/tool call is genuinely needed, choose from [AVAILABLE TOOLS] and respond with:\n")
 	sb.WriteString("<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n")
 	sb.WriteString("- When dispatching subagents (e.g. 'delegate_task'), inform the user before <tool_call> of the subagent's goal.\n")
@@ -1360,7 +1930,7 @@ func formatDeltaPrompt(messages []ChatMessage, startIndex int) string {
 	sb.WriteString("- If the previous tool result is sufficient or the task is finished, DO NOT call more tools. Respond directly to the user in normal text with your final response.\n\n")
 	sb.WriteString("Assistant:")
 
-	return sb.String()
+	return sanitizePromptUTF8(sb.String())
 }
 
 // -----------------------------------------------------------------------------
@@ -1952,7 +2522,7 @@ func formatSubagentAnnouncement(toolCalls []ParsedToolCall) string {
 					if t.Goal != "" {
 						g := strings.TrimSpace(t.Goal)
 						if len(g) > 90 {
-							g = g[:87] + "..."
+							g = utf8Head(g, 87) + "..."
 						}
 						goals = append(goals, g)
 					}
@@ -1960,7 +2530,7 @@ func formatSubagentAnnouncement(toolCalls []ParsedToolCall) string {
 			} else if args.Goal != "" {
 				g := strings.TrimSpace(args.Goal)
 				if len(g) > 90 {
-					g = g[:87] + "..."
+					g = utf8Head(g, 87) + "..."
 				}
 				goals = append(goals, g)
 			}
@@ -1976,7 +2546,7 @@ func formatSubagentAnnouncement(toolCalls []ParsedToolCall) string {
 			_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
 			p := strings.TrimSpace(args.Prompt)
 			if len(p) > 90 {
-				p = p[:87] + "..."
+				p = utf8Head(p, 87) + "..."
 			}
 			if p != "" {
 				return fmt.Sprintf("Iniciando subagente Antigravity: %s", p)
@@ -1990,7 +2560,7 @@ func formatSubagentAnnouncement(toolCalls []ParsedToolCall) string {
 			_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
 			t := strings.TrimSpace(args.Task)
 			if len(t) > 90 {
-				t = t[:87] + "..."
+				t = utf8Head(t, 87) + "..."
 			}
 			if t != "" {
 				return fmt.Sprintf("Iniciando Code Agent Antigravity: %s", t)
@@ -2004,7 +2574,7 @@ func formatSubagentAnnouncement(toolCalls []ParsedToolCall) string {
 			_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
 			q := strings.TrimSpace(args.Query)
 			if len(q) > 90 {
-				q = q[:87] + "..."
+				q = utf8Head(q, 87) + "..."
 			}
 			if q != "" {
 				return fmt.Sprintf("Iniciando Research Agent Antigravity: %s", q)
@@ -3048,322 +3618,83 @@ func handleStreamingCompletion(
 
 	var accumulatedText strings.Builder
 	var streamedText strings.Builder
-	var streamPending strings.Builder
+	var filter toolStreamFilter
 	activeConvID := initialConvID
-	isBufferingTool := false
-	var lastWaitErr error
-	var lastStderr string
-	var agyResultReceived bool
+	var outcome agyStreamOutcome
+
+	hooks := agyStreamHooks{
+		OnTextDelta: func(delta string) {
+			accumulatedText.WriteString(delta)
+			if toEmit := filter.Feed(delta); toEmit != "" {
+				streamedText.WriteString(toEmit)
+				emitTextChunk(toEmit)
+			}
+		},
+		IsBufferingTool: filter.Buffering,
+	}
 
 	for attempt := 1; attempt <= 2; attempt++ {
 		if attempt > 1 {
+			if ctx.Err() != nil || r.Context().Err() != nil {
+				log.Printf("[Proxy] Not retrying %s: request context finished (%v)", completionID, ctx.Err())
+				break
+			}
 			log.Printf("[Proxy] Retrying agy (attempt %d/2) for %s...", attempt, completionID)
-			accumulatedText.Reset()
-			streamedText.Reset()
-			streamPending.Reset()
-			isBufferingTool = false
-			agyResultReceived = false
 			time.Sleep(500 * time.Millisecond)
 
 			if isDelta {
-				if ctx.Err() != nil || r.Context().Err() != nil {
-					log.Printf("[Proxy-Delta] Client disconnected/canceled for convID %s. Preserving session.", initialConvID)
-					return
-				}
 				log.Printf("[Proxy-Delta] Attempt 1 failed on convID %s. Falling back to fresh anchor.", initialConvID)
 				if sessionKey != "" {
 					globalSessions.Invalidate(sessionKey)
 				}
-				var filteredArgs []string
-				for idx := 0; idx < len(args); idx++ {
-					if args[idx] == "--conversation" {
-						idx++
-						continue
-					}
-					filteredArgs = append(filteredArgs, args[idx])
-				}
-				args = filteredArgs
+				args = removeArgWithValue(args, "--conversation")
 				finalPrompt = fallbackFullPrompt
 				isDelta = false
 				activeConvID = ""
 			}
 		}
+		accumulatedText.Reset()
+		streamedText.Reset()
+		filter.Reset()
 
-		cmd := exec.CommandContext(ctx, agyBin, args...)
-		cmd.Dir = workspaceDir
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		cmd.Env = append(os.Environ(), "PATH="+filepath.Join(os.Getenv("HOME"), ".local/bin")+":"+os.Getenv("PATH"))
-
-		stdin, err := cmd.StdinPipe()
-		if err != nil {
-			emitErrorSSE(fmt.Sprintf("StdinPipe error: %v", err))
+		outcome = runAgyStream(ctx, args, finalPrompt+"\n", hooks)
+		if outcome.ConvID != "" {
+			activeConvID = outcome.ConvID
+		}
+		if outcome.StopReason == agyStopStartError {
+			log.Printf("[Proxy] Command start error: %v", outcome.StartErr)
+			emitErrorSSE(outcome.failureMessage())
 			return
 		}
-
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			emitErrorSSE(fmt.Sprintf("StdoutPipe error: %v", err))
-			return
+		if outcome.ResultReceived && accumulatedText.Len() == 0 && outcome.ResultResponse != "" {
+			accumulatedText.WriteString(outcome.ResultResponse)
 		}
-		stderr, err := cmd.StderrPipe()
-		if err != nil {
-			emitErrorSSE(fmt.Sprintf("StderrPipe error: %v", err))
-			return
+		// Flush any held-back text if no tool call was encountered
+		if rest := filter.Flush(); rest != "" {
+			streamedText.WriteString(rest)
+			emitTextChunk(rest)
 		}
-
-		var stderrBuf bytes.Buffer
-		var stderrWg sync.WaitGroup
-		stderrWg.Add(1)
-		go func() {
-			defer stderrWg.Done()
-			_, _ = io.Copy(&stderrBuf, stderr)
-		}()
-
-		if err := cmd.Start(); err != nil {
-			log.Printf("[Proxy] Command start error: %v", err)
-			emitErrorSSE(fmt.Sprintf("Process start error: %v", err))
-			return
-		}
-
-		var processExited atomic.Bool
-		doneProcess := make(chan struct{})
-		go func() {
-			select {
-			case <-ctx.Done():
-				if !processExited.Load() && cmd.Process != nil {
-					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				}
-			case <-doneProcess:
-			}
-		}()
-
-		// Stream prompt through StdinPipe in background
-		go func() {
-			defer stdin.Close()
-			if _, err := io.WriteString(stdin, finalPrompt+"\n"); err != nil {
-				log.Printf("[Proxy] stdin write error: %v", err)
-			}
-		}()
-
-		type streamEvent struct {
-			line []byte
-			err  error
-		}
-		eventChan := make(chan streamEvent, 4096)
-		streamDone := make(chan struct{})
-		var closeOnce sync.Once
-		safeCloseStreamDone := func() {
-			closeOnce.Do(func() {
-				close(streamDone)
-			})
-		}
-
-		go func() {
-			defer close(eventChan)
-			scanner := bufio.NewScanner(stdout)
-			buf := make([]byte, 1024*1024)
-			scanner.Buffer(buf, 1024*1024)
-			for scanner.Scan() {
-				raw := scanner.Bytes()
-				b := make([]byte, len(raw))
-				copy(b, raw)
-				select {
-				case eventChan <- streamEvent{line: b}:
-				case <-ctx.Done():
-					return
-				case <-streamDone:
-					return
-				}
-			}
-			if err := scanner.Err(); err != nil {
-				select {
-				case eventChan <- streamEvent{err: err}:
-				case <-ctx.Done():
-					return
-				case <-streamDone:
-					return
-				}
-			}
-		}()
-
-		for ev := range eventChan {
-			if ev.err != nil {
-				log.Printf("[Proxy] stdout scanner error: %v", ev.err)
-				continue
-			}
-			line := ev.line
-			if len(line) == 0 {
-				continue
-			}
-
-			var event struct {
-				Event          string `json:"event"`
-				ConversationID string `json:"conversation_id"`
-				StepUpdate     struct {
-					TextDelta string `json:"text_delta"`
-				} `json:"step_update"`
-				Result struct {
-					ConversationID string `json:"conversation_id"`
-					Status         string `json:"status"`
-					Response       string `json:"response"`
-				} `json:"result"`
-			}
-
-			if err := json.Unmarshal(line, &event); err != nil {
-				continue
-			}
-
-			if event.Event == "init" && event.ConversationID != "" {
-				activeConvID = event.ConversationID
-			} else if event.Event == "result" {
-				if event.Result.ConversationID != "" {
-					activeConvID = event.Result.ConversationID
-				} else if event.ConversationID != "" {
-					activeConvID = event.ConversationID
-				}
-				if accumulatedText.Len() == 0 && event.Result.Response != "" {
-					accumulatedText.WriteString(event.Result.Response)
-				}
-				agyResultReceived = true
-				safeCloseStreamDone()
-				break
-			} else if event.Event == "step_update" {
-				delta := event.StepUpdate.TextDelta
-				if delta != "" {
-					accumulatedText.WriteString(delta)
-
-					if !isBufferingTool {
-						streamPending.WriteString(delta)
-						pending := streamPending.String()
-
-						// 1. Check if any complete tool marker is present
-						markers := []string{"<tool_call>", "<function_call>", "call:default_api:", "```tool_call"}
-						toolMarkerIdx := -1
-						for _, m := range markers {
-							if idx := strings.Index(pending, m); idx != -1 {
-								if toolMarkerIdx == -1 || idx < toolMarkerIdx {
-									toolMarkerIdx = idx
-								}
-							}
-						}
-
-						if toolMarkerIdx != -1 {
-							// Found tool marker! Stream any text before the marker, then activate tool buffering.
-							toEmit := pending[:toolMarkerIdx]
-							if toEmit != "" {
-								streamedText.WriteString(toEmit)
-								emitTextChunk(toEmit)
-							}
-							isBufferingTool = true
-							streamPending.Reset()
-						} else {
-							// 2. Check if trailing suffix matches an incomplete prefix of a tool marker
-							splitIdx := len(pending)
-							maxMarkerLen := 0
-							for _, m := range markers {
-								if len(m) > maxMarkerLen {
-									maxMarkerLen = len(m)
-								}
-							}
-							maxK := len(pending)
-							if maxK > maxMarkerLen {
-								maxK = maxMarkerLen
-							}
-							foundPrefix := false
-							for k := maxK; k > 0; k-- {
-								suffix := pending[len(pending)-k:]
-								for _, m := range markers {
-									if strings.HasPrefix(m, suffix) {
-										splitIdx = len(pending) - k
-										foundPrefix = true
-										break
-									}
-								}
-								if foundPrefix {
-									break
-								}
-							}
-
-							toEmit := pending[:splitIdx]
-							toHold := pending[splitIdx:]
-
-							if toEmit != "" {
-								streamedText.WriteString(toEmit)
-								emitTextChunk(toEmit)
-							}
-							streamPending.Reset()
-							streamPending.WriteString(toHold)
-						}
-					}
-				}
-			}
-		}
-		safeCloseStreamDone()
-
-		// Flush any pending text if no tool call was encountered
-		if !isBufferingTool && streamPending.Len() > 0 {
-			remaining := streamPending.String()
-			streamedText.WriteString(remaining)
-			emitTextChunk(remaining)
-			streamPending.Reset()
-		}
-
-		waitDone := make(chan error, 1)
-		go func() {
-			waitDone <- cmd.Wait()
-		}()
-
-		if agyResultReceived {
-			// agy has already emitted the complete "result".
-			// Give it a brief grace period (500ms) to exit cleanly;
-			// if background tasks (MCP servers, language server, telemetry) linger,
-			// terminate the process group immediately so we don't stall the client.
-			select {
-			case err := <-waitDone:
-				lastWaitErr = err
-			case <-time.After(500 * time.Millisecond):
-				log.Printf("[Proxy] agy completed turn but lingered on shutdown; terminating process group (pid %d)", cmd.Process.Pid)
-				if cmd.Process != nil {
-					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				}
-				lastWaitErr = <-waitDone
-			}
-		} else {
-			lastWaitErr = <-waitDone
-		}
-
-		processExited.Store(true)
-		close(doneProcess)
-		stderrWg.Wait()
-		lastStderr = strings.TrimSpace(stderrBuf.String())
-
-		// If success or we got output, break retry loop
-		if lastWaitErr == nil || accumulatedText.Len() > 0 || agyResultReceived {
+		if outcome.ResultReceived || accumulatedText.Len() > 0 || !outcome.retryable() {
 			break
 		}
-		log.Printf("[Proxy] agy attempt %d failed (err=%v, stderr=%s)", attempt, lastWaitErr, lastStderr)
-		if strings.Contains(lastStderr, "--effort is not supported") {
-			var filteredArgs []string
-			for idx := 0; idx < len(args); idx++ {
-				if args[idx] == "--effort" {
-					idx++ // skip value too
-					continue
-				}
-				filteredArgs = append(filteredArgs, args[idx])
-			}
-			args = filteredArgs
+		log.Printf("[Proxy] agy attempt %d failed (err=%v, stderr=%s)", attempt, outcome.WaitErr, outcome.Stderr)
+		if strings.Contains(outcome.Stderr, "--effort is not supported") {
+			args = removeArgWithValue(args, "--effort")
 		}
 	}
 
-	if lastWaitErr != nil && !agyResultReceived && accumulatedText.Len() == 0 {
-		errDetails := lastStderr
-		if errDetails == "" {
-			errDetails = lastWaitErr.Error()
-		}
-		emitErrorSSE(errDetails)
+	if accumulatedText.Len() == 0 {
+		// Never close the SSE stream with an empty answer: clients such as Hermes treat
+		// that as a network failure (EmptyStreamError) and blindly resend the full context.
+		log.Printf("[Proxy] %s finished without output (reason=%s, err=%v, elapsed=%s)",
+			completionID, outcome.StopReason, outcome.WaitErr, outcome.Elapsed.Round(time.Millisecond))
+		emitErrorSSE(outcome.failureMessage())
 		return
 	}
-
+	if outcome.watchdogStopped() {
+		log.Printf("[Proxy] %s finalized by watchdog (reason=%s) with %d chars buffered (tool buffering=%v)",
+			completionID, outcome.StopReason, accumulatedText.Len(), filter.Buffering())
+	}
 	fullOutput := accumulatedText.String()
 	cleanText, toolCalls := parseToolCalls(fullOutput)
 
@@ -3436,6 +3767,12 @@ func handleStreamingCompletion(
 		}
 		tb, _ := json.Marshal(txtChunk)
 		writeSSE(fmt.Sprintf("data: %s\n\n", tb))
+	}
+
+	if len(toolCalls) == 0 {
+		if notice := streamCompletionNotice(outcome, streamedText.Len()+len(unstreamed) > 0); notice != "" {
+			emitTextChunk(notice)
+		}
 	}
 
 	inTok := promptTokens
@@ -3570,7 +3907,7 @@ func handleStreamingCompletion(
 
 	writeSSE("data: [DONE]\n\n")
 
-	if !isAux && sessionKey != "" && activeConvID != "" && (lastWaitErr == nil || agyResultReceived || accumulatedText.Len() > 0) {
+	if !isAux && sessionKey != "" && activeConvID != "" && (outcome.ResultReceived || accumulatedText.Len() > 0) {
 		oldState := globalSessions.Get(sessionKey)
 		turns := 1
 		createdAt := time.Now()
@@ -4160,14 +4497,11 @@ func handleStreamingAnthropicMessages(
 
 	var accumulatedText strings.Builder
 	var streamedText strings.Builder
-	var streamPending strings.Builder
+	var filter toolStreamFilter
 	activeConvID := initialConvID
-	isBufferingTool := false
-	var lastWaitErr error
-	var lastStderr string
-	var agyResultReceived bool
 	currentBlockIdx := 0
 	textBlockStarted := false
+	var outcome agyStreamOutcome
 
 	emitTextDelta := func(text string) {
 		if text == "" {
@@ -4198,238 +4532,76 @@ func handleStreamingAnthropicMessages(
 		writeSSE("content_block_delta", string(b))
 	}
 
+	hooks := agyStreamHooks{
+		OnTextDelta: func(delta string) {
+			accumulatedText.WriteString(delta)
+			if toEmit := filter.Feed(delta); toEmit != "" {
+				streamedText.WriteString(toEmit)
+				emitTextDelta(toEmit)
+			}
+		},
+		IsBufferingTool: filter.Buffering,
+	}
+
 	for attempt := 1; attempt <= 2; attempt++ {
 		if attempt > 1 {
+			if ctx.Err() != nil {
+				log.Printf("[Anthropic-Proxy] Not retrying %s: request context finished (%v)", completionID, ctx.Err())
+				break
+			}
 			log.Printf("[Anthropic-Proxy] Retrying agy (attempt %d/2) for %s...", attempt, completionID)
-			accumulatedText.Reset()
-			streamedText.Reset()
-			streamPending.Reset()
-			isBufferingTool = false
-			agyResultReceived = false
 			time.Sleep(500 * time.Millisecond)
 
 			if isDelta {
-				if ctx.Err() != nil {
-					return
-				}
+				log.Printf("[Anthropic-Delta] Attempt 1 failed on convID %s. Falling back to fresh anchor.", initialConvID)
 				if sessionKey != "" {
 					globalSessions.Invalidate(sessionKey)
 				}
-				var filteredArgs []string
-				for idx := 0; idx < len(args); idx++ {
-					if args[idx] == "--conversation" {
-						idx++
-						continue
-					}
-					filteredArgs = append(filteredArgs, args[idx])
-				}
-				args = filteredArgs
+				args = removeArgWithValue(args, "--conversation")
 				finalPrompt = fallbackFullPrompt
 				isDelta = false
 				activeConvID = ""
 			}
 		}
+		accumulatedText.Reset()
+		streamedText.Reset()
+		filter.Reset()
 
-		cmd := exec.CommandContext(ctx, agyBin, args...)
-		cmd.Dir = workspaceDir
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		cmd.Env = append(os.Environ(), "PATH="+filepath.Join(os.Getenv("HOME"), ".local/bin")+":"+os.Getenv("PATH"))
-
-		stdin, err := cmd.StdinPipe()
-		if err != nil {
-			emitErrorSSE(fmt.Sprintf("StdinPipe error: %v", err))
+		outcome = runAgyStream(ctx, args, finalPrompt+"\n", hooks)
+		if outcome.ConvID != "" {
+			activeConvID = outcome.ConvID
+		}
+		if outcome.StopReason == agyStopStartError {
+			log.Printf("[Anthropic-Proxy] Command start error: %v", outcome.StartErr)
+			emitErrorSSE(outcome.failureMessage())
 			return
 		}
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			emitErrorSSE(fmt.Sprintf("StdoutPipe error: %v", err))
-			return
+		if outcome.ResultReceived && accumulatedText.Len() == 0 && outcome.ResultResponse != "" {
+			accumulatedText.WriteString(outcome.ResultResponse)
 		}
-		stderr, err := cmd.StderrPipe()
-		if err != nil {
-			emitErrorSSE(fmt.Sprintf("StderrPipe error: %v", err))
-			return
+		// Flush any held-back text if no tool call was encountered
+		if rest := filter.Flush(); rest != "" {
+			streamedText.WriteString(rest)
+			emitTextDelta(rest)
 		}
-
-		var stderrBuf bytes.Buffer
-		var stderrWg sync.WaitGroup
-		stderrWg.Add(1)
-		go func() {
-			defer stderrWg.Done()
-			_, _ = io.Copy(&stderrBuf, stderr)
-		}()
-
-		if err := cmd.Start(); err != nil {
-			lastWaitErr = err
-			lastStderr = fmt.Sprintf("cmd.Start: %v", err)
-			continue
-		}
-
-		var processExited atomic.Bool
-		doneProcess := make(chan struct{})
-		go func() {
-			select {
-			case <-ctx.Done():
-				if !processExited.Load() && cmd.Process != nil {
-					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				}
-			case <-doneProcess:
-			}
-		}()
-
-		go func() {
-			defer stdin.Close()
-			_, _ = io.WriteString(stdin, finalPrompt)
-		}()
-
-		reader := bufio.NewReader(stdout)
-		for {
-			line, err := reader.ReadBytes('\n')
-			if len(line) > 0 {
-				lineStr := strings.TrimRight(string(line), "\r\n")
-				if lineStr == "" {
-					continue
-				}
-
-				var event struct {
-					Event          string `json:"event"`
-					ConversationID string `json:"conversation_id"`
-					StepUpdate     struct {
-						TextDelta string `json:"text_delta"`
-					} `json:"step_update"`
-					Result struct {
-						ConversationID string `json:"conversation_id"`
-						Status         string `json:"status"`
-						Response       string `json:"response"`
-					} `json:"result"`
-				}
-				if errJ := json.Unmarshal([]byte(lineStr), &event); errJ == nil {
-					if event.Event == "init" && event.ConversationID != "" {
-						activeConvID = event.ConversationID
-					} else if event.Event == "result" {
-						if event.Result.ConversationID != "" {
-							activeConvID = event.Result.ConversationID
-						} else if event.ConversationID != "" {
-							activeConvID = event.ConversationID
-						}
-						if accumulatedText.Len() == 0 && event.Result.Response != "" {
-							accumulatedText.WriteString(event.Result.Response)
-						}
-						agyResultReceived = true
-						break
-					} else if event.Event == "step_update" {
-						delta := event.StepUpdate.TextDelta
-						if delta != "" {
-							accumulatedText.WriteString(delta)
-							if !isBufferingTool {
-								streamPending.WriteString(delta)
-								pending := streamPending.String()
-
-								markers := []string{"<tool_call>", "<function_call>", "call:default_api:", "```tool_call"}
-								toolMarkerIdx := -1
-								for _, m := range markers {
-									if idx := strings.Index(pending, m); idx != -1 {
-										if toolMarkerIdx == -1 || idx < toolMarkerIdx {
-											toolMarkerIdx = idx
-										}
-									}
-								}
-
-								if toolMarkerIdx != -1 {
-									toEmit := pending[:toolMarkerIdx]
-									if toEmit != "" {
-										streamedText.WriteString(toEmit)
-										emitTextDelta(toEmit)
-									}
-									isBufferingTool = true
-									streamPending.Reset()
-								} else {
-									splitIdx := len(pending)
-									maxMarkerLen := 0
-									for _, m := range markers {
-										if len(m) > maxMarkerLen {
-											maxMarkerLen = len(m)
-										}
-									}
-									maxK := len(pending)
-									if maxK > maxMarkerLen {
-										maxK = maxMarkerLen
-									}
-									foundPrefix := false
-									for k := maxK; k > 0; k-- {
-										suffix := pending[len(pending)-k:]
-										for _, m := range markers {
-											if strings.HasPrefix(m, suffix) {
-												splitIdx = len(pending) - k
-												foundPrefix = true
-												break
-											}
-										}
-										if foundPrefix {
-											break
-										}
-									}
-
-									toEmit := pending[:splitIdx]
-									toHold := pending[splitIdx:]
-									if toEmit != "" {
-										streamedText.WriteString(toEmit)
-										emitTextDelta(toEmit)
-									}
-									streamPending.Reset()
-									streamPending.WriteString(toHold)
-								}
-							}
-						}
-					}
-				}
-			}
-			if err != nil {
-				break
-			}
-		}
-
-		if !isBufferingTool && streamPending.Len() > 0 {
-			rem := streamPending.String()
-			streamedText.WriteString(rem)
-			emitTextDelta(rem)
-			streamPending.Reset()
-		}
-
-		waitDone := make(chan error, 1)
-		go func() { waitDone <- cmd.Wait() }()
-
-		if agyResultReceived {
-			select {
-			case err := <-waitDone:
-				lastWaitErr = err
-			case <-time.After(500 * time.Millisecond):
-				if cmd.Process != nil {
-					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				}
-				lastWaitErr = <-waitDone
-			}
-		} else {
-			lastWaitErr = <-waitDone
-		}
-
-		processExited.Store(true)
-		close(doneProcess)
-		stderrWg.Wait()
-		lastStderr = strings.TrimSpace(stderrBuf.String())
-
-		if lastWaitErr == nil || accumulatedText.Len() > 0 || agyResultReceived {
+		if outcome.ResultReceived || accumulatedText.Len() > 0 || !outcome.retryable() {
 			break
+		}
+		log.Printf("[Anthropic-Proxy] agy attempt %d failed (err=%v, stderr=%s)", attempt, outcome.WaitErr, outcome.Stderr)
+		if strings.Contains(outcome.Stderr, "--effort is not supported") {
+			args = removeArgWithValue(args, "--effort")
 		}
 	}
 
-	if lastWaitErr != nil && !agyResultReceived && accumulatedText.Len() == 0 {
-		errDetails := lastStderr
-		if errDetails == "" {
-			errDetails = lastWaitErr.Error()
-		}
-		emitErrorSSE(errDetails)
+	if accumulatedText.Len() == 0 {
+		log.Printf("[Anthropic-Proxy] %s finished without output (reason=%s, err=%v, elapsed=%s)",
+			completionID, outcome.StopReason, outcome.WaitErr, outcome.Elapsed.Round(time.Millisecond))
+		emitErrorSSE(outcome.failureMessage())
 		return
+	}
+	if outcome.watchdogStopped() {
+		log.Printf("[Anthropic-Proxy] %s finalized by watchdog (reason=%s) with %d chars buffered (tool buffering=%v)",
+			completionID, outcome.StopReason, accumulatedText.Len(), filter.Buffering())
 	}
 
 	fullOutput := accumulatedText.String()
